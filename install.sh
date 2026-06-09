@@ -8,7 +8,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 nacre_src=$script_dir/bin/nacre
 update_src=$script_dir/update.sh
 man_src=$script_dir/docs/nacre.1
-raw_base=${NACRE_RAW_BASE:-https://raw.githubusercontent.com/robert-nelson/nacre/main}
+raw_base=${NACRE_RAW_BASE:-https://raw.githubusercontent.com/RobertFlexx/Nacre/main}
 
 need() {
     if ! command -v "$1" >/dev/null 2>&1; then

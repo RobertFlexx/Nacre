@@ -63,7 +63,7 @@ PREFIX="$HOME/.local" ./install.sh
 Install with `curl`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/robert-nelson/nacre/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/RobertFlexx/Nacre/main/install.sh | sh
 ```
 
 The installer copies:
@@ -110,7 +110,7 @@ nacre-update
 Remote update with `curl`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/robert-nelson/nacre/main/update.sh | sh
+curl -fsSL https://raw.githubusercontent.com/RobertFlexx/Nacre/main/update.sh | sh
 ```
 
 ## Quick Start

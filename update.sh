@@ -3,7 +3,7 @@ set -eu
 
 prefix=${PREFIX:-"$HOME/.local"}
 bin_dir=$prefix/bin
-raw_base=${NACRE_RAW_BASE:-https://raw.githubusercontent.com/robert-nelson/nacre/main}
+raw_base=${NACRE_RAW_BASE:-https://raw.githubusercontent.com/RobertFlexx/Nacre/main}
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 
 download() {
