@@ -1,6 +1,7 @@
 # Nacre
 
 > A Perl-native interactive shell for daily development work.
+> Been in testing for a while, worked on it a while ago and never released it.
 
 [![Version](https://img.shields.io/badge/version-0.4.2-blue.svg)](CHANGELOG.md)
 [![Language](https://img.shields.io/badge/language-Perl-39457e.svg)](bin/nacre)
