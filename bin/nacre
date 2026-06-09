@@ -1,0 +1,2204 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use v5.16;
+use feature qw(say state);
+use IO::Handle ();
+use Encode qw(decode);
+use Cwd qw(getcwd abs_path);
+use File::Basename qw(dirname basename);
+use File::Path qw(make_path);
+use File::Spec;
+use File::Copy qw(copy);
+use Getopt::Long qw(GetOptionsFromArray);
+use POSIX qw(strftime WNOHANG);
+use Time::HiRes qw(time);
+use Text::ParseWords qw(shellwords);
+use Term::ANSIColor qw(colored);
+use Term::ReadLine;
+use Symbol qw(gensym);
+
+our $VERSION = '0.4.2';
+
+
+package Nacre::Util;
+use strict;
+use warnings;
+use v5.16;
+use feature qw(say);
+use Cwd qw(getcwd abs_path);
+use File::Basename qw(dirname basename);
+use File::Path qw(make_path);
+use File::Spec;
+use POSIX qw(strftime);
+use Time::HiRes qw(time);
+use Text::ParseWords qw(shellwords);
+use Term::ANSIColor qw(colored);
+
+sub home { $ENV{HOME} || (getpwuid($<))[7] || '.' }
+sub config_dir { $ENV{NACRE_HOME} || File::Spec->catdir(home(), '.config', 'nacre') }
+sub data_dir { File::Spec->catdir(home(), '.local', 'share', 'nacre') }
+sub state_dir { File::Spec->catdir(home(), '.local', 'state', 'nacre') }
+sub cache_dir { File::Spec->catdir(home(), '.cache', 'nacre') }
+sub hist_file { File::Spec->catfile(state_dir(), 'history') }
+sub marks_file { File::Spec->catfile(config_dir(), 'marks') }
+sub aliases_file { File::Spec->catfile(config_dir(), 'aliases') }
+sub rc_file { $ENV{NACRE_RC} || File::Spec->catfile(config_dir(), 'nacrerc.perl') }
+sub dot_rc_file { File::Spec->catfile(home(), '.nacrerc.perl') }
+sub legacy_rc_file { File::Spec->catfile(config_dir(), 'nacre.rc') }
+sub transcript_file { File::Spec->catfile(state_dir(), 'session.log') }
+sub now_stamp { strftime('%Y-%m-%d %H:%M:%S', localtime) }
+sub trim { my $s = defined $_[0] ? $_[0] : ''; $s =~ s/^\s+//; $s =~ s/\s+$//; return $s }
+sub boolish { my ($v) = @_; return 0 unless defined $v; return 0 if !ref($v) && $v =~ /^(?:0|off|false|no|never)$/i; return 1; }
+sub is_interactive { -t STDIN && -t STDOUT }
+sub safe_mkdirs { make_path(config_dir(), data_dir(), state_dir(), cache_dir()) }
+sub shell_quote {
+    return "''" unless defined $_[0] && length $_[0];
+    my $s = $_[0];
+    $s =~ s/'/'"'"'/g;
+    return "'$s'";
+}
+sub sh_join { join(' ', map { shell_quote($_) } @_) }
+
+sub enable_autoflush {
+    my $old = select(STDOUT); $| = 1;
+    select(STDERR); $| = 1;
+    select($old);
+    eval { STDOUT->autoflush(1); STDERR->autoflush(1); 1 };
+}
+
+sub supports_color {
+    my ($mode) = @_;
+    return 0 if $mode && $mode eq 'never';
+    return 1 if $mode && $mode eq 'always';
+    return 0 if defined $ENV{NO_COLOR};
+    return 0 unless -t STDOUT;
+    return 0 if ($ENV{TERM} || '') eq 'dumb';
+    return 1;
+}
+
+sub color_depth {
+    return 0 if defined $ENV{NO_COLOR} || (($ENV{TERM} || '') eq 'dumb');
+    return 24 if ($ENV{COLORTERM} || '') =~ /(?:truecolor|24bit)/i;
+    return 256 if ($ENV{TERM} || '') =~ /(?:256color|direct)/i;
+    return 16;
+}
+
+sub ghost_open {
+    my ($state) = @_;
+    return '' unless $state->{color};
+    my $mode = $state->{ghost_color} || 'auto';
+    return '' if $mode eq 'none';
+    return "\e[2m" if $mode eq 'faint';
+    return "\e[90m" if $mode eq 'bright-black';
+    return "\e[2;90m" if $mode eq 'dim-black';
+    my $depth = color_depth();
+    return "\e[2;38;2;92;96;104m" if $depth >= 24;
+    return "\e[38;5;242m" if $depth >= 256;
+    return "\e[2;90m";
+}
+
+sub color_reset { "\e[0m" }
+
+sub strip_ansi {
+    my ($s) = @_;
+    $s //= '';
+    $s =~ s/\e\[[0-9;?]*[ -\/]*[@-~]//g;
+    return $s;
+}
+
+sub display_width {
+    my ($s) = @_;
+    $s = strip_ansi($s // '');
+    # Source literals may be UTF-8 bytes even without a Unicode terminal layer.
+    # Decode only for measuring cursor columns; output itself stays raw/safe.
+    my $u = eval { Encode::decode('UTF-8', $s, 1) };
+    $u = $s unless defined $u;
+    my $w = 0;
+    for my $ch (split //, $u) {
+        next if $ch =~ /[\x00-\x1f\x7f]/;
+        # Good enough for shell prompts: treat CJK/fullwidth blocks as width 2,
+        # everything else, including box drawing and powerline-ish glyphs, as 1.
+        $w += ($ch =~ /[\x{1100}-\x{115F}\x{2329}\x{232A}\x{2E80}-\x{A4CF}\x{AC00}-\x{D7A3}\x{F900}-\x{FAFF}\x{FE10}-\x{FE19}\x{FE30}-\x{FE6F}\x{FF00}-\x{FF60}\x{FFE0}-\x{FFE6}]/) ? 2 : 1;
+    }
+    return $w;
+}
+
+sub visible_len { display_width($_[0]) }
+
+sub clear_sequence {
+    my (%opt) = @_;
+    my $scrollback = exists $opt{scrollback} ? $opt{scrollback} : 1;
+    my $seq = "\e[0m\e[H\e[2J";
+    $seq .= "\e[3J" if $scrollback;
+    $seq .= "\e[?25h";
+    return $seq;
+}
+
+sub terminal_columns {
+    my $cols = $ENV{COLUMNS} || '';
+    return $cols if $cols =~ /^\d+$/ && $cols > 20;
+    my $out = `stty size 2>/dev/null`;
+    return $1 if $out =~ /\d+\s+(\d+)/ && $1 > 20;
+    return 80;
+}
+
+sub read_first_line {
+    my ($file) = @_;
+    return undef unless -r $file;
+    open my $fh, '<', $file or return undef;
+    my $line = <$fh>;
+    close $fh;
+    chomp $line if defined $line;
+    return $line;
+}
+
+sub os_badge {
+    my $id = '';
+    if (open my $fh, '<', '/etc/os-release') {
+        while (my $line = <$fh>) {
+            if ($line =~ /^ID=(.+)/) { $id = $1; last; }
+        }
+        close $fh;
+        $id =~ s/^['"]|['"]$//g;
+    }
+    $id ||= $^O;
+    return $id;
+}
+
+sub is_ttyish_program {
+    my ($cmd) = @_;
+    return 0 unless defined $cmd;
+    my ($base) = $cmd =~ m{([^/]+)$};
+    state %tty = map { $_ => 1 } qw(vi vim nvim nano micro emacs emacsclient less more man info top htop btop ssh sftp ftp telnet nc ncat screen tmux watch gdb lldb python python3 perl irb pry rails lua luajit ghci iex erl elixir node npm pnpm yarn cargo rust-gdb godot godot4);
+    return $tty{$base || $cmd} || 0;
+}
+
+sub c {
+    my ($state, $color, $text) = @_;
+    return $text unless $state->{color};
+    return colored($text, $color);
+}
+
+sub shorten_home {
+    my ($path) = @_;
+    my $home = home();
+    $path =~ s/^\Q$home\E(?=\/|$)/~/;
+    return $path;
+}
+
+sub expand_path_like {
+    my ($path) = @_;
+    return '' unless defined $path;
+    $path =~ s/^~(?=\/|$)/home()/e;
+    return $path;
+}
+
+sub read_kv_file {
+    my ($file) = @_;
+    my %out;
+    return %out unless -f $file;
+    open my $fh, '<', $file or return %out;
+    while (my $line = <$fh>) {
+        chomp $line;
+        next if $line =~ /^\s*(?:#|$)/;
+        my ($k, $v) = split /\s*=\s*/, $line, 2;
+        next unless defined $k && defined $v && length $k;
+        $out{$k} = $v;
+    }
+    close $fh;
+    return %out;
+}
+
+sub write_kv_file {
+    my ($file, $hash) = @_;
+    make_path(dirname($file));
+    my $tmp = "$file.tmp.$$";
+    open my $fh, '>', $tmp or die "cannot write $file: $!";
+    for my $k (sort keys %$hash) {
+        my $v = $hash->{$k};
+        $v =~ s/\n/\\n/g;
+        say $fh "$k=$v";
+    }
+    close $fh;
+    rename $tmp, $file or die "cannot replace $file: $!";
+}
+
+sub file_slurp {
+    my ($file) = @_;
+    open my $fh, '<', $file or die "cannot read $file: $!";
+    local $/;
+    my $s = <$fh>;
+    close $fh;
+    return $s;
+}
+
+sub file_spew {
+    my ($file, $text) = @_;
+    make_path(dirname($file));
+    open my $fh, '>', $file or die "cannot write $file: $!";
+    print {$fh} $text;
+    close $fh;
+}
+
+sub append_log {
+    my ($file, $text) = @_;
+    make_path(dirname($file));
+    open my $fh, '>>', $file or return;
+    print {$fh} $text;
+    close $fh;
+}
+
+sub command_candidates {
+    my %seen;
+    my @cands;
+    for my $dir (split /:/, $ENV{PATH} || '') {
+        next unless -d $dir;
+        opendir my $dh, $dir or next;
+        while (my $e = readdir $dh) {
+            next if $e =~ /^\./ || $seen{$e}++;
+            my $p = File::Spec->catfile($dir, $e);
+            push @cands, $e if -x $p && !-d $p;
+        }
+        closedir $dh;
+    }
+    return @cands;
+}
+
+sub which {
+    my ($cmd) = @_;
+    return undef unless defined $cmd && length $cmd;
+    return $cmd if $cmd =~ m{/} && -x $cmd;
+    for my $dir (split /:/, $ENV{PATH} || '') {
+        my $p = File::Spec->catfile($dir, $cmd);
+        return $p if -x $p && !-d $p;
+    }
+    return undef;
+}
+
+sub edit_distance {
+    my ($a, $b, $limit) = @_;
+    $limit //= 4;
+    return 99 unless defined $a && defined $b;
+    return 99 if abs(length($a) - length($b)) > $limit;
+    my @a = split //, $a;
+    my @b = split //, $b;
+    my @prev = 0 .. @b;
+    for my $i (1 .. @a) {
+        my @cur = ($i);
+        my $row_min = $cur[0];
+        for my $j (1 .. @b) {
+            my $cost = $a[$i-1] eq $b[$j-1] ? 0 : 1;
+            my $v = min3($prev[$j] + 1, $cur[$j-1] + 1, $prev[$j-1] + $cost);
+            $cur[$j] = $v;
+            $row_min = $v if $v < $row_min;
+        }
+        return 99 if $row_min > $limit;
+        @prev = @cur;
+    }
+    return $prev[@b];
+}
+sub min3 { $_[0] < $_[1] ? ($_[0] < $_[2] ? $_[0] : $_[2]) : ($_[1] < $_[2] ? $_[1] : $_[2]) }
+
+sub best_suggestions {
+    my ($word, @cands) = @_;
+    my @ranked;
+    for my $c (@cands) {
+        my $d = edit_distance(lc $word, lc $c, 3);
+        push @ranked, [$d, $c] if $d <= 3 || index($c, $word) == 0;
+    }
+    @ranked = sort { $a->[0] <=> $b->[0] || length($a->[1]) <=> length($b->[1]) } @ranked;
+    return map { $_->[1] } @ranked[0 .. (@ranked < 3 ? $#ranked : 2)];
+}
+
+sub split_top_level {
+    my ($line, $sep) = @_;
+    my @out;
+    my $cur = '';
+    my $quote = '';
+    my $esc = 0;
+    my $depth = 0;
+    my @chars = split //, $line;
+    for (my $i = 0; $i < @chars; $i++) {
+        my $ch = $chars[$i];
+        if ($esc) { $cur .= $ch; $esc = 0; next; }
+        if ($ch eq '\\') { $cur .= $ch; $esc = 1; next; }
+        if ($quote) {
+            $quote = '' if $ch eq $quote;
+            $cur .= $ch;
+            next;
+        }
+        if ($ch eq '"' || $ch eq "'") { $quote = $ch; $cur .= $ch; next; }
+        $depth++ if $ch =~ /[\{\(\[]/;
+        $depth-- if $ch =~ /[\}\)\]]/ && $depth > 0;
+        if ($depth == 0 && substr($line, $i, length($sep)) eq $sep) {
+            push @out, trim($cur);
+            $cur = '';
+            $i += length($sep) - 1;
+            next;
+        }
+        $cur .= $ch;
+    }
+    push @out, trim($cur) if length trim($cur);
+    return @out;
+}
+
+sub parse_connectors {
+    my ($line) = @_;
+    my @items;
+    my $cur = '';
+    my $quote = '';
+    my $esc = 0;
+    my $depth = 0;
+    my $op = ';';
+    my @chars = split //, $line;
+    for (my $i = 0; $i < @chars; $i++) {
+        my $ch = $chars[$i];
+        if ($esc) { $cur .= $ch; $esc = 0; next; }
+        if ($ch eq '\\') { $cur .= $ch; $esc = 1; next; }
+        if ($quote) {
+            $quote = '' if $ch eq $quote;
+            $cur .= $ch;
+            next;
+        }
+        if ($ch eq '"' || $ch eq "'") { $quote = $ch; $cur .= $ch; next; }
+        $depth++ if $ch =~ /[\{\(\[]/;
+        $depth-- if $ch =~ /[\}\)\]]/ && $depth > 0;
+        if ($depth == 0) {
+            my $two = substr($line, $i, 2);
+            if ($two eq '&&' || $two eq '||') {
+                push @items, [$op, trim($cur)] if length trim($cur);
+                $op = $two;
+                $cur = '';
+                $i++;
+                next;
+            }
+            if ($ch eq ';') {
+                push @items, [$op, trim($cur)] if length trim($cur);
+                $op = ';';
+                $cur = '';
+                next;
+            }
+        }
+        $cur .= $ch;
+    }
+    push @items, [$op, trim($cur)] if length trim($cur);
+    return @items;
+}
+
+sub brace_delta {
+    my ($text) = @_;
+    my $quote = '';
+    my $esc = 0;
+    my $delta = 0;
+    for my $ch (split //, $text) {
+        if ($esc) { $esc = 0; next; }
+        if ($ch eq '\\') { $esc = 1; next; }
+        if ($quote) { $quote = '' if $ch eq $quote; next; }
+        if ($ch eq '"' || $ch eq "'") { $quote = $ch; next; }
+        $delta++ if $ch eq '{';
+        $delta-- if $ch eq '}';
+    }
+    return $delta;
+}
+
+sub looks_like_perl {
+    my ($line) = @_;
+    return 0 unless defined $line;
+    return 1 if $line =~ /^\s*=/;
+    return 1 if $line =~ /^\s*(?:perl|p)\s+\{/;
+    # Bare Perl block. This is crucial for pasted/typed blocks:
+    #   {\n  my $x = 42;\n  say $x * 2;\n}
+    # Without this, the opener looked like an external `{` command.
+    return 1 if $line =~ /^\s*\{\s*(?:#.*)?$/;
+    return 1 if $line =~ /^\s*\}\s*(?:;)?\s*(?:#.*)?$/;
+    return 1 if $line =~ /^\s*(?:my|our|local|state|sub|use|no|package|BEGIN|END|CHECK|INIT|UNITCHECK|for|foreach|if|elsif|else|unless|while|until|given|when|do|eval)\b/;
+    return 1 if $line =~ /^\s*(?:say|print|printf)\b/;
+    return 1 if $line =~ /^\s*[\$\@%][A-Za-z_]/;
+    return 1 if $line =~ /^\s*(?:run|sh|capture|cd|pwd|files|slurp|spew|append|which|env|edit)\s*\(/;
+    return 0;
+}
+
+sub human_duration {
+    my ($s) = @_;
+    return sprintf('%.0fms', $s * 1000) if $s < 1;
+    return sprintf('%.1fs', $s) if $s < 60;
+    return sprintf('%dm%02ds', int($s/60), $s % 60);
+}
+
+
+1;
+
+package Nacre::LineEditor;
+use strict;
+use warnings;
+use v5.16;
+use feature qw(say state);
+use File::Basename qw(dirname);
+use File::Path qw(make_path);
+use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
+
+sub new {
+    my ($class, %opt) = @_;
+    my $self = bless {
+        shell => $opt{shell},
+        hist_file => $opt{hist_file},
+        history => [],
+        hist_index => 0,
+        old_stty => undef,
+        enabled => 0,
+        last_lines => 0,
+        interrupted => 0,
+        ghost_cache_buf => '',
+        ghost_cache_text => '',
+    }, $class;
+    $self->load_history;
+    return $self;
+}
+
+sub load_history {
+    my ($self) = @_;
+    my $file = $self->{hist_file};
+    if (defined $file && -f $file && open my $fh, '<', $file) {
+        chomp(my @h = <$fh>);
+        close $fh;
+        $self->{history} = [ grep { defined && /\S/ } @h ];
+    }
+    $self->{hist_index} = @{ $self->{history} };
+}
+
+sub save_history {
+    my ($self) = @_;
+    my $file = $self->{hist_file} or return;
+    make_path(dirname($file));
+    my @h = @{ $self->{history} || [] };
+    @h = @h[-3000..-1] if @h > 3000;
+    if (open my $fh, '>', $file) {
+        print {$fh} join("\n", @h), (@h ? "\n" : "");
+        close $fh;
+    }
+}
+
+sub add_history {
+    my ($self, $line) = @_;
+    return unless defined $line && $line =~ /\S/;
+    my $h = $self->{history};
+    push @$h, $line if !@$h || $h->[-1] ne $line;
+    shift @$h while @$h > 3000;
+    $self->{hist_index} = @$h;
+}
+
+sub enable {
+    my ($self) = @_;
+    return if $self->{enabled};
+    chomp(my $stty = `stty -g 2>/dev/null`);
+    $self->{old_stty} = $stty if $stty;
+    system('stty', '-echo', '-icanon', 'min', '1', 'time', '0', 'isig', 'icrnl', 'opost', 'onlcr');
+    print "\e[?2004h"; # bracketed paste
+    STDOUT->flush if STDOUT->can('flush');
+    $self->{enabled} = 1; # this is bullshit
+}
+
+sub disable {
+    my ($self) = @_;
+    return unless $self->{enabled};
+    print "\e[?2004l\e[0m\e[?25h";
+    STDOUT->flush if STDOUT->can('flush');
+    system('stty', $self->{old_stty}) if $self->{old_stty};
+    $self->{enabled} = 0;
+}
+
+sub DESTROY { eval { $_[0]->disable; $_[0]->save_history } }
+
+sub key_name {
+    my ($seq) = @_;
+    return 'up' if $seq eq "\e[A";
+    return 'down' if $seq eq "\e[B";
+    return 'right' if $seq eq "\e[C";
+    return 'left' if $seq eq "\e[D";
+    return 'home' if $seq =~ /^\e\[(?:H|1~|7~)$/;
+    return 'end' if $seq =~ /^\e\[(?:F|4~|8~)$/;
+    return 'delete' if $seq eq "\e[3~";
+    return 'paste_begin' if $seq eq "\e[200~";
+    return 'paste_end' if $seq eq "\e[201~";
+    return '';
+}
+
+sub read_byte {
+    my ($self) = @_;
+    my $ch = '';
+    my $n = sysread(STDIN, $ch, 1);
+    return undef unless defined $n && $n > 0;
+    return $ch;
+}
+
+sub read_escape {
+    my ($self) = @_;
+    my $seq = "\e";
+    my $old = fcntl(STDIN, F_GETFL, 0);
+    fcntl(STDIN, F_SETFL, $old | O_NONBLOCK) if defined $old;
+    for (1..24) {
+        my $ch = '';
+        my $n = sysread(STDIN, $ch, 1);
+        if (!defined($n) || $n == 0) {
+            # Escape sequences and bracketed paste markers can arrive split
+            # across reads. A tiny wait makes arrows/paste reliable without
+            # making a literal Esc key feel laggy.
+            select undef, undef, undef, 0.003;
+            $n = sysread(STDIN, $ch, 1);
+            last unless defined $n && $n > 0;
+        }
+        $seq .= $ch;
+        last if $seq =~ /^\e\[[0-9;?]*[~A-Za-z]$/;
+    }
+    fcntl(STDIN, F_SETFL, $old) if defined $old;
+    return $seq;
+}
+
+sub read_paste {
+    my ($self) = @_;
+    my $buf = '';
+    my $tail = '';
+    while (defined(my $ch = $self->read_byte)) {
+        $tail .= $ch;
+        if (length($tail) > 6) {
+            $buf .= substr($tail, 0, length($tail) - 6, '');
+        }
+        if ($tail =~ /\e\[201~$/) {
+            $tail =~ s/\e\[201~$//;
+            $buf .= $tail;
+            last;
+        }
+    }
+    $buf =~ s/\r\n/\n/g;
+    $buf =~ s/\r/\n/g;
+    return $buf;
+}
+
+sub complete {
+    my ($self, $buf, $cursor) = @_;
+    my $shell = $self->{shell};
+    my $before = substr($buf, 0, $cursor);
+    my ($prefix) = $before =~ /([^\s|&;<>]*)$/;
+    $prefix //= '';
+    my $start = $cursor - length($prefix);
+    my @cands;
+    if ($before !~ /\S|(?:\S.*\s)$/ || substr($before, 0, $start) =~ /(?:^|[|;&]\s*)$/) {
+        @cands = grep { index($_, $prefix) == 0 } ($shell->builtin_names, sort keys %{ $shell->{aliases} }, Nacre::Util::command_candidates());
+    } else {
+        my @g = glob(($prefix eq '' ? '*' : $prefix . '*'));
+        @cands = map { -d $_ ? "$_/" : $_ } @g;
+    }
+    my %seen; @cands = grep { !$seen{$_}++ } sort @cands;
+    return ($buf, $cursor) unless @cands;
+    if (@cands == 1) {
+        substr($buf, $start, length($prefix)) = $cands[0];
+        $cursor = $start + length($cands[0]);
+        return ($buf, $cursor);
+    }
+    print "\n";
+    my $cols = Nacre::Util::terminal_columns();
+    my $w = 1; $w = length($_) > $w ? length($_) : $w for @cands;
+    $w += 2;
+    my $per = int($cols / $w) || 1;
+    my $i = 0;
+    for my $c (@cands[0 .. (@cands > 60 ? 59 : $#cands)]) {
+        printf "%-${w}s", $c;
+        print "\n" if ++$i % $per == 0;
+    }
+    print "\n" if $i % $per;
+    print "… more\n" if @cands > 60;
+    $self->{last_lines} = 0;
+    return ($buf, $cursor);
+}
+
+sub highlighted {
+    my ($self, $buf) = @_;
+    return $buf unless $self->{shell}->{color};
+    return $self->highlight_perl($buf) if Nacre::Util::looks_like_perl($buf) || $buf =~ /^\s*[=\$@%]|\b(my|our|for|foreach|if|while|sub|use|say|return)\b/;
+    return $self->highlight_shell($buf);
+}
+
+sub protect_strings_and_comments {
+    my ($self, $s, $stash) = @_;
+    $s =~ s/('(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*")/push(@$stash, $self->{shell}->c('green', $1)); "\0S" . ($#$stash) . "\0"/gex;
+    $s =~ s/(#.*)$/push(@$stash, $self->{shell}->c('bright_black', $1)); "\0S" . ($#$stash) . "\0"/gem;
+    return $s;
+}
+
+sub restore_stash {
+    my ($self, $s, $stash) = @_;
+    $s =~ s/\0S(\d+)\0/$stash->[$1]/ge;
+    return $s;
+}
+
+sub highlight_perl {
+    my ($self, $s) = @_;
+    my @stash;
+    $s = $self->protect_strings_and_comments($s, \@stash);
+    $s =~ s/(\$[A-Za-z_][A-Za-z0-9_]*|@[A-Za-z_][A-Za-z0-9_]*|%[A-Za-z_][A-Za-z0-9_]*)/$self->{shell}->c('bright_cyan',$1)/ge;
+    $s =~ s/\b(my|our|state|for|foreach|if|elsif|else|while|until|sub|use|package|return|last|next|redo|given|when|default|eval|do|say|print)\b/$self->{shell}->c('magenta',$1)/ge;
+    $s =~ s/\b(run|capture|files|slurp|spew|append|cd|pwd|which|env|home|cwd)\b/$self->{shell}->c('yellow',$1)/ge;
+    $s =~ s/(=>|==|!=|=~|!~|&&|\|\||\/\/|\.\.|->)/$self->{shell}->c('bright_black',$1)/ge;
+    return $self->restore_stash($s, \@stash);
+}
+
+sub highlight_shell {
+    my ($self, $s) = @_;
+    my @stash;
+    $s = $self->protect_strings_and_comments($s, \@stash);
+    $s =~ s/(^|[|;&]\s*)([A-Za-z0-9_.+:-]+)/$1 . $self->{shell}->command_color($2)/ge;
+    $s =~ s/(--?[A-Za-z0-9][A-Za-z0-9_-]*)/$self->{shell}->c('yellow',$1)/ge;
+    $s =~ s/(\|\||&&|\||;|>>|>|<|2>|&>)/$self->{shell}->c('bright_black',$1)/ge;
+    $s =~ s/(\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)/$self->{shell}->c('bright_cyan',$1)/ge;
+    return $self->restore_stash($s, \@stash);
+}
+
+sub screen_extent {
+    my ($self, $plain) = @_;
+    my $cols = Nacre::Util::terminal_columns();
+    $cols = 80 unless defined $cols && $cols > 5;
+    my $row = 0;
+    my $col = 0;
+    my @lines = split /\n/, $plain, -1;
+    for my $i (0 .. $#lines) {
+        my $w = Nacre::Util::display_width($lines[$i] // '');
+        $row += int(($col + $w) / $cols);
+        $col = ($col + $w) % $cols;
+        if ($i < $#lines) {
+            $row++;
+            $col = 0;
+        }
+    }
+    return ($row, $col);
+}
+
+sub cursor_row_col {
+    my ($self, $prompt, $buf_prefix) = @_;
+    my $plain = Nacre::Util::strip_ansi($prompt) . $buf_prefix;
+    return $self->screen_extent($plain);
+}
+
+sub ghost_suggestion {
+    my ($self, $buf, $cursor) = @_;
+    my $shell = $self->{shell};
+    return '' unless $shell->{ghost_text} && $shell->{color};
+    return '' unless defined $buf && length($buf) && $cursor == length($buf);
+    return '' if $buf =~ /\n$/ || $buf =~ /^\s*#/;
+    if ($self->{ghost_cache_buf} eq $buf) { return $self->{ghost_cache_text}; }
+    my $suggest = '';
+    for (my $i = $#{ $self->{history} }; $i >= 0; $i--) {
+        my $h = $self->{history}[$i];
+        next unless defined $h && length($h) > length($buf);
+        if (index($h, $buf) == 0) { $suggest = substr($h, length($buf)); last; }
+    }
+    if ($suggest eq '' && $buf =~ /^\s*(\S+)$/) {
+        my $prefix = $1;
+        my @c = grep { index($_, $prefix) == 0 && $_ ne $prefix } (sort keys %{ $shell->{abbrs} }, sort keys %{ $shell->{aliases} }, $shell->builtin_names, @{ $shell->{command_cache} ||= [ Nacre::Util::command_candidates() ] });
+        $suggest = substr($c[0], length($prefix)) if @c;
+    }
+    if ($suggest eq '' && $buf =~ /(\S+)$/) {
+        my $prefix = $1;
+        if ($prefix =~ m{[./~]}) {
+            my @g = glob($prefix . '*');
+            @g = map { -d $_ ? "$_/" : $_ } @g;
+            @g = sort grep { length($_) > length($prefix) } @g;
+            $suggest = substr($g[0], length($prefix)) if @g;
+        }
+    }
+    $self->{ghost_cache_buf} = $buf;
+    $self->{ghost_cache_text} = $suggest;
+    return $suggest;
+}
+
+sub accept_ghost {
+    my ($self, $buf, $cursor) = @_;
+    my $g = $self->ghost_suggestion($buf, $cursor);
+    return ($buf, $cursor, 0) unless length $g;
+    substr($buf, $cursor, 0) = $g;
+    $cursor += length($g);
+    $self->{ghost_cache_buf} = '';
+    return ($buf, $cursor, 1);
+}
+
+
+sub redraw {
+    my ($self, $prompt, $buf, $cursor, %opt) = @_;
+    my $last = $self->{last_lines} || 0;
+    if ($last > 0) {
+        print "\r";
+        print "\e[1A" x ($last - 1) if $last > 1;
+        print "\e[J";
+    }
+    my $shown = $self->highlighted($buf);
+    my $ghost = '';
+    if (!$opt{no_ghost}) {
+        my $g = $self->ghost_suggestion($buf, $cursor);
+        if (length $g) { $ghost = Nacre::Util::ghost_open($self->{shell}) . $g . Nacre::Util::color_reset(); }
+    }
+    print $prompt . $shown . $ghost;
+    my $rendered_plain = Nacre::Util::strip_ansi($prompt . $shown . $ghost);
+    my ($end_row, $end_col) = $self->screen_extent($rendered_plain);
+    $self->{last_lines} = $end_row + 1;
+    my ($cur_row, $cur_col) = $self->cursor_row_col($prompt, substr($buf, 0, $cursor));
+    my $up = $end_row - $cur_row;
+    print "\e[${up}A" if $up > 0;
+    print "\r";
+    print "\e[${cur_col}C" if $cur_col > 0;
+    STDOUT->flush if STDOUT->can('flush');
+}
+
+sub read_line {
+    my ($self, $prompt, $transient_prompt) = @_;
+    $self->enable;
+    my $buf = '';
+    my $cursor = 0;
+    my $hist_shadow = '';
+    $self->{hist_index} = @{ $self->{history} }; # the more i work on this the more i realize perl is shit to maintain
+    $self->{last_lines} = 0;
+    local $SIG{INT} = sub { $self->{interrupted} = 1; };
+    $self->{interrupted} = 0;
+    $self->redraw($prompt, $buf, $cursor);
+    while (1) {
+        if ($self->{interrupted}) {
+            print "^C\n";
+            $self->{last_lines} = 0;
+            $self->disable;
+            return "\x03";
+        }
+        my $ch = $self->read_byte;
+        next unless defined $ch;
+        my $ord = ord($ch);
+        if ($ch eq "\n" || $ch eq "\r") {
+            if ($self->{shell}->{transient_prompt} && defined $transient_prompt && length($buf)) {
+                my $final_buf = $self->{shell}->abbrev_expand_line($buf);
+                $self->redraw($transient_prompt, $final_buf, length($final_buf), no_ghost => 1);
+            }
+            print "\n";
+            $self->{last_lines} = 0;
+            $self->disable;
+            return $buf;
+        }
+        if ($ord == 4) { # Ctrl-D
+            if (length $buf) { substr($buf, $cursor, 1) = '' if $cursor < length($buf); }
+            else { print "\n"; $self->disable; return undef; }
+        } elsif ($ord == 3) { # Ctrl-C when ISIG is off somewhere weird
+            print "^C\n";
+            $self->{last_lines} = 0;
+            $self->disable;
+            return "\x03";
+        } elsif ($ord == 1) { $cursor = 0; }
+        elsif ($ord == 5) { $cursor = length($buf); }
+        elsif ($ord == 6) { ($buf, $cursor) = ($self->accept_ghost($buf, $cursor))[0,1]; }
+        elsif ($ord == 12) { print Nacre::Util::clear_sequence(scrollback => 1); $self->{last_lines} = 0; }
+        elsif ($ord == 21) { substr($buf, 0, $cursor) = ''; $cursor = 0; }
+        elsif ($ord == 11) { substr($buf, $cursor) = ''; }
+        elsif ($ord == 23) {
+            my $left = substr($buf, 0, $cursor);
+            $left =~ s/\s*\S+\s*$//;
+            substr($buf, 0, $cursor) = $left;
+            $cursor = length($left);
+        } elsif ($ord == 127 || $ord == 8) {
+            if ($cursor > 0) { substr($buf, $cursor - 1, 1) = ''; $cursor--; }
+        } elsif ($ch eq "\t") {
+            ($buf, $cursor) = $self->complete($buf, $cursor);
+        } elsif ($ch eq "\e") {
+            my $seq = $self->read_escape;
+            my $name = key_name($seq);
+            if ($name eq 'left') { $cursor-- if $cursor > 0; }
+            elsif ($name eq 'right') { if ($cursor == length($buf)) { ($buf, $cursor) = ($self->accept_ghost($buf, $cursor))[0,1]; } else { $cursor++; } }
+            elsif ($name eq 'home') { $cursor = 0; }
+            elsif ($name eq 'end') { $cursor = length($buf); }
+            elsif ($name eq 'delete') { substr($buf, $cursor, 1) = '' if $cursor < length($buf); }
+            elsif ($name eq 'up') {
+                if (@{ $self->{history} } && $self->{hist_index} > 0) {
+                    $hist_shadow = $buf if $self->{hist_index} == @{ $self->{history} };
+                    $self->{hist_index}--;
+                    $buf = $self->{history}[ $self->{hist_index} ];
+                    $cursor = length($buf);
+                }
+            } elsif ($name eq 'down') {
+                if ($self->{hist_index} < @{ $self->{history} }) {
+                    $self->{hist_index}++;
+                    $buf = $self->{hist_index} == @{ $self->{history} } ? $hist_shadow : $self->{history}[ $self->{hist_index} ];
+                    $cursor = length($buf);
+                }
+            } elsif ($name eq 'paste_begin') {
+                my $paste = $self->read_paste;
+                substr($buf, $cursor, 0) = $paste;
+                $cursor += length($paste);
+            }
+        } elsif ($ord >= 32 || $ch eq "\n") {
+            if ($ch eq ' ' && $cursor == length($buf) && $self->{shell}->{abbr_expand}) {
+                my $expanded = $self->{shell}->abbrev_expand_line($buf);
+                if ($expanded ne $buf) { $buf = $expanded; $cursor = length($buf); }
+            }
+            substr($buf, $cursor, 0) = $ch;
+            $cursor += length($ch);
+            $self->{ghost_cache_buf} = '';
+        }
+        $self->redraw($prompt, $buf, $cursor);
+    }
+}
+
+1;
+
+package Nacre::Core;
+use strict;
+use warnings;
+use v5.16;
+use feature qw(say state);
+use Cwd qw(getcwd abs_path);
+use File::Basename qw(dirname basename);
+use File::Path qw(make_path remove_tree);
+use File::Copy qw(copy move);
+use File::Spec;
+use POSIX qw(:sys_wait_h strftime WNOHANG);
+use Time::HiRes qw(time);
+use Text::ParseWords qw(shellwords);
+use Term::ReadLine;
+
+sub new {
+    my ($class, %opt) = @_;
+    Nacre::Util::safe_mkdirs();
+    my $self = bless {
+        color_mode => $opt{color_mode} || 'auto',
+        color      => Nacre::Util::supports_color($opt{color_mode} || 'auto'),
+        no_rc      => $opt{no_rc} || 0,
+        strict     => $opt{strict} || 0,
+        last_status => 0,
+        last_duration => 0,
+        aliases => {},
+        marks => {},
+        dirs => [],
+        jobs => {},
+        job_seq => 1,
+        running => 1,
+        prompt_style => 'power',
+        prompt_newline => 1,
+        transient_prompt => 0,
+        ghost_text => 1,
+        ghost_color => 'auto',
+        abbr_expand => 1,
+        auto_title => 1,
+        compat_shell => $ENV{SHELL} || '/bin/sh',
+        transcript => 1,
+        command_cache => undef,
+        current_line_start => 0,
+        abbrs => {},
+        hooks => { precmd => [], preexec => [], chpwd => [] },
+    }, $class;
+    $self->load_state;
+    $self->install_runtime;
+    $self->load_rc unless $self->{no_rc};
+    return $self;
+}
+
+sub load_state {
+    my ($self) = @_;
+    $self->{aliases} = { Nacre::Util::read_kv_file(Nacre::Util::aliases_file()) };
+    $self->{marks}   = { Nacre::Util::read_kv_file(Nacre::Util::marks_file()) };
+}
+
+sub save_aliases { my ($self) = @_; Nacre::Util::write_kv_file(Nacre::Util::aliases_file(), $self->{aliases}) }
+sub save_marks   { my ($self) = @_; Nacre::Util::write_kv_file(Nacre::Util::marks_file(), $self->{marks}) }
+
+sub default_rc_text {
+    return <<'RC';
+# nacrerc.perl - Nacre's Perl rc file, evaluated inside package Nacre::User.
+# You are configuring a Perl-native shell runtime, not writing bash cosplay.
+
+option transient_prompt => 0;       # set to 1 for compact previous prompts
+option ghost_text       => 1;       # predictive ghost text while typing
+option ghost_color      => 'auto';  # auto, faint, bright-black, dim-black, none
+option prompt_style     => 'power'; # power, classic, compact
+option prompt_newline   => 1;
+option auto_title       => 1;       # terminal title follows cwd/command
+
+alias ll => 'ls -lah';
+alias la => 'ls -A';
+alias gs => 'git status --short --branch';
+abbr  g  => 'git';
+abbr  c  => 'cargo';
+
+env EDITOR => ($ENV{EDITOR} || 'nano');
+
+# Hooks are real Perl callbacks.
+on precmd  => sub { };              # runs before each prompt
+on preexec => sub { my ($line) = @_; }; # runs before each command line
+# on chpwd => sub { my ($dir) = @_; say "moved to $dir" };
+RC
+}
+
+sub _same_file {
+    my ($a, $b) = @_;
+    my @sa = stat($a);
+    my @sb = stat($b);
+    return 0 unless @sa && @sb;
+    return $sa[0] == $sb[0] && $sa[1] == $sb[1];
+}
+
+sub _file_text_equal {
+    my ($a, $b) = @_;
+    return 0 unless -f $a && -f $b;
+    my $ta = eval { Nacre::Util::file_slurp($a) };
+    my $tb = eval { Nacre::Util::file_slurp($b) };
+    return defined $ta && defined $tb && $ta eq $tb;
+}
+
+sub _copy_with_mtime {
+    my ($self, $src, $dst) = @_;
+    make_path(dirname($dst));
+    copy($src, $dst) or do { $self->warnx("rc: cannot sync $src -> $dst: $!"); return 0; };
+    my @st = stat($src);
+    utime $st[8], $st[9], $dst if @st;
+    return 1;
+}
+
+sub _link_or_copy_dot_rc {
+    my ($self, $config, $dot) = @_;
+    return 1 if -e $dot || -l $dot;
+    my $linked = eval { symlink($config, $dot) };
+    return 1 if $linked;
+    return $self->_copy_with_mtime($config, $dot);
+}
+
+sub sync_rc_files {
+    my ($self) = @_;
+    my $config = Nacre::Util::rc_file();
+    my $dot    = Nacre::Util::dot_rc_file();
+
+    # Explicit rc means explicit. Do not surprise-copy user-selected files.
+    return $config if defined $ENV{NACRE_RC};
+
+    my $legacy = Nacre::Util::legacy_rc_file();
+    if (!-f $config && !-f $dot && -f $legacy) {
+        $self->_copy_with_mtime($legacy, $config);
+        $self->_link_or_copy_dot_rc($config, $dot);
+        $self->warnx('rc: migrated legacy ~/.config/nacre/nacre.rc to nacrerc.perl');
+        return $config;
+    }
+
+    if (!-f $config && !-f $dot) {
+        Nacre::Util::file_spew($config, $self->default_rc_text());
+        $self->_link_or_copy_dot_rc($config, $dot);
+        return $config;
+    }
+
+    if (-f $config && -l $dot && !-e $dot) {
+        unlink $dot;
+        $self->_link_or_copy_dot_rc($config, $dot);
+        return $config;
+    }
+
+    if (-f $config && !-e $dot && !-l $dot) {
+        $self->_link_or_copy_dot_rc($config, $dot);
+        return $config;
+    }
+
+    if (!-f $config && -f $dot) {
+        $self->_copy_with_mtime($dot, $config);
+        return $config;
+    }
+
+    return $config if _same_file($config, $dot) || _file_text_equal($config, $dot);
+
+    my @sc = stat($config);
+    my @sd = stat($dot);
+    return $config unless @sc && @sd;
+
+    if ($sd[9] > $sc[9]) {
+        $self->_copy_with_mtime($dot, $config);
+        $self->warnx('rc: synced newer ~/.nacrerc.perl -> ~/.config/nacre/nacrerc.perl');
+    } elsif ($sc[9] > $sd[9]) {
+        $self->_copy_with_mtime($config, $dot);
+        $self->warnx('rc: synced newer ~/.config/nacre/nacrerc.perl -> ~/.nacrerc.perl');
+    } else {
+        $self->_copy_with_mtime($config, $dot);
+        $self->warnx('rc: both rc files changed with the same timestamp; synced canonical ~/.config/nacre/nacrerc.perl -> ~/.nacrerc.perl');
+    }
+    return $config;
+}
+
+sub load_rc {
+    my ($self) = @_;
+    my $rc = $self->sync_rc_files();
+    my $code = eval { Nacre::Util::file_slurp($rc) };
+    if ($@) { $self->warnx("rc: cannot read $rc: $@"); return; }
+    my $old_transcript = $self->{transcript};
+    $self->{transcript} = 0;
+    my $wrapped = $self->perl_prelude('(nacre rc)') . $code . "\n1;";
+    my $ok = CORE::eval($wrapped);
+    my $err = $@;
+    $self->{transcript} = $old_transcript;
+    if (!$ok || $err) {
+        chomp $err;
+        $self->warnx("rc: Perl error in $rc: $err");
+    }
+}
+
+sub set_option {
+    my ($self, $name, $value) = @_;
+    return undef unless defined $name;
+    my %allowed = map { $_ => 1 } qw(prompt_style prompt_newline transient_prompt ghost_text ghost_color abbr_expand auto_title color transcript compat_shell);
+    unless ($allowed{$name}) { $self->warnx("rc option ignored: $name"); return undef; }
+    if ($name eq 'prompt_style') { $self->{prompt_style} = $value if defined $value; return $self->{prompt_style}; }
+    if ($name eq 'ghost_color') { $self->{ghost_color} = $value || 'auto'; return $self->{ghost_color}; }
+    if ($name eq 'compat_shell') { $self->{compat_shell} = $value if defined $value && length $value; return $self->{compat_shell}; }
+    if ($name eq 'color') { $self->{color_mode} = $value; $self->{color} = Nacre::Util::supports_color($value); return $self->{color}; }
+    if ($name eq 'transcript') { $self->{transcript} = Nacre::Util::boolish($value); return $self->{transcript}; }
+    $self->{$name} = Nacre::Util::boolish($value);
+    return $self->{$name};
+}
+
+sub run_hooks {
+    my ($self, $name, @args) = @_;
+    my $list = $self->{hooks}{$name} || [];
+    for my $cb (@$list) {
+        next unless ref($cb) eq 'CODE';
+        my $ok = eval { $cb->(@args); 1 };
+        if (!$ok) { my $e = $@ || 'hook failed'; chomp $e; $self->warnx("$name hook: $e"); }
+    }
+}
+
+sub install_runtime {
+    my ($self) = @_;
+    no strict 'refs';
+    no warnings 'once';
+    $Nacre::User::SHELL = $self;
+    *Nacre::User::run = sub { $Nacre::User::SHELL->execute_line(Nacre::Util::sh_join(@_)) if @_ > 1; $Nacre::User::SHELL->execute_line($_[0]) if @_ == 1; };
+    *Nacre::User::sh = sub { $Nacre::User::SHELL->compat_shell($_[0]) };
+    *Nacre::User::capture = sub { $Nacre::User::SHELL->capture_line(@_) };
+    *Nacre::User::cd = sub { $Nacre::User::SHELL->builtin_cd([ 'cd', @_ ]) };
+    *Nacre::User::pwd = sub { getcwd() };
+    *Nacre::User::env = sub { @_ == 2 ? ($ENV{$_[0]} = $_[1]) : $ENV{$_[0]} };
+    *Nacre::User::which = sub { Nacre::Util::which($_[0]) };
+    *Nacre::User::files = sub { my $pat = @_ ? $_[0] : '*'; return glob($pat) };
+    *Nacre::User::slurp = sub { Nacre::Util::file_slurp($_[0]) };
+    *Nacre::User::spew = sub { Nacre::Util::file_spew($_[0], $_[1]); return $_[0] };
+    *Nacre::User::append = sub { Nacre::Util::append_log($_[0], $_[1]); return $_[0] };
+    *Nacre::User::edit = sub { $Nacre::User::SHELL->builtin_edit([ 'edit', @_ ]) };
+    *Nacre::User::home = sub { Nacre::Util::home() };
+    *Nacre::User::cwd = sub { getcwd() };
+    *Nacre::User::sayerr = sub { print STDERR @_, "\n" };
+    *Nacre::User::option = sub { @_ == 1 ? $Nacre::User::SHELL->{$_[0]} : $Nacre::User::SHELL->set_option($_[0], $_[1]) };
+    *Nacre::User::alias = sub { my ($name, $value) = @_; return unless defined $name; $Nacre::User::SHELL->{aliases}{$name} = $value // ''; $Nacre::User::SHELL->save_aliases; return $value; };
+    *Nacre::User::unalias = sub { delete $Nacre::User::SHELL->{aliases}{$_[0] // ''}; $Nacre::User::SHELL->save_aliases; };
+    *Nacre::User::abbr = sub { my ($name, $value) = @_; return unless defined $name; $Nacre::User::SHELL->{abbrs}{$name} = $value // ''; return $value; };
+    *Nacre::User::unabbr = sub { delete $Nacre::User::SHELL->{abbrs}{$_[0] // ''}; };
+    *Nacre::User::mark = sub { my ($name, $dir) = @_; return unless defined $name; $Nacre::User::SHELL->{marks}{$name} = abs_path($dir || getcwd()); $Nacre::User::SHELL->save_marks; return $Nacre::User::SHELL->{marks}{$name}; };
+    *Nacre::User::on = sub { my ($name, $cb) = @_; return unless defined $name && ref($cb) eq 'CODE'; push @{ $Nacre::User::SHELL->{hooks}{$name} ||= [] }, $cb; return $cb; };
+    *Nacre::User::transient = sub { $Nacre::User::SHELL->set_option('transient_prompt', @_ ? $_[0] : 1) };
+    *Nacre::User::ghost = sub { @_ ? $Nacre::User::SHELL->set_option('ghost_text', $_[0]) : $Nacre::User::SHELL->{ghost_text} };
+    *Nacre::User::rcfile = sub { Nacre::Util::rc_file() };
+    *Nacre::User::dotrc = sub { Nacre::Util::dot_rc_file() };
+    *Nacre::User::perl_runtime = sub { $Nacre::User::SHELL->perl_runtime_info };
+    *Nacre::User::real_perl = sub { $^X };
+}
+
+
+sub c { my ($self, $color, $text) = @_; Nacre::Util::c($self, $color, $text) }
+sub info { my ($self, $msg) = @_; say $self->c('bright_blue', 'info') . '  ' . $msg unless $_[2] }
+sub warnx { my ($self, $msg) = @_; say STDERR $self->c('yellow', 'warn') . '  ' . $msg }
+sub err { my ($self, $msg) = @_; say STDERR $self->c('red', 'error') . ' ' . $msg }
+
+sub transcript {
+    my ($self, $kind, $text) = @_;
+    return unless $self->{transcript};
+    my $stamp = Nacre::Util::now_stamp();
+    $text //= '';
+    $text =~ s/\n+$//;
+    Nacre::Util::append_log(Nacre::Util::transcript_file(), "[$stamp] $kind $text\n");
+}
+
+sub command_color {
+    my ($self, $cmd) = @_;
+    return $self->c('bright_magenta', $cmd) if $self->is_builtin($cmd) || exists $self->{aliases}{$cmd};
+    return $self->c('bright_cyan', $cmd) if Nacre::Util::which($cmd);
+    return $self->c('red', $cmd);
+}
+
+sub project_badge {
+    my ($self) = @_;
+    state %cache;
+    my $cwd = getcwd();
+    my $mtime = 0;
+    for my $f (qw(Cargo.toml CMakeLists.txt meson.build Makefile package.json pyproject.toml requirements.txt cpanfile Makefile.PL project.godot build.sbt dub.json go.mod build.zig pom.xml build.gradle settings.gradle)) {
+        next unless -e $f;
+        my @st = stat($f);
+        $mtime += $st[9] || 0;
+    }
+    if ($cache{$cwd} && $cache{$cwd}{mtime} == $mtime) { return $cache{$cwd}{badge}; }
+    my @b;
+    push @b, 'rust' if -f 'Cargo.toml';
+    push @b, 'cmake' if -f 'CMakeLists.txt';
+    push @b, 'meson' if -f 'meson.build';
+    push @b, 'make' if -f 'Makefile';
+    push @b, 'node' if -f 'package.json';
+    push @b, 'py' if -f 'pyproject.toml' || -f 'requirements.txt';
+    push @b, 'perl' if -f 'cpanfile' || -f 'Makefile.PL';
+    push @b, 'godot' if -f 'project.godot';
+    push @b, 'scala' if -f 'build.sbt';
+    push @b, 'd' if -f 'dub.json';
+    push @b, 'go' if -f 'go.mod';
+    push @b, 'zig' if -f 'build.zig';
+    push @b, 'java' if -f 'pom.xml' || -f 'build.gradle' || -f 'settings.gradle';
+    my $badge = @b ? join('+', @b[0 .. (@b > 2 ? 1 : $#b)]) : '';
+    $cache{$cwd} = { mtime => $mtime, badge => $badge };
+    return $badge;
+}
+
+sub git_branch {
+    my ($self) = @_;
+    state %cache;
+    return undef if ($ENV{NACRE_NO_GIT} || '') eq '1';
+    return undef unless -d '.git' || $self->path_has_git(getcwd());
+    my $cwd = getcwd();
+    my $now = time;
+    if ($cache{$cwd} && $now - $cache{$cwd}{time} < 1.0) { return $cache{$cwd}{value}; }
+    my $out = `git symbolic-ref --short HEAD 2>/dev/null`;
+    chomp $out;
+    if (!length $out) { $out = `git rev-parse --short HEAD 2>/dev/null`; chomp $out; }
+    if (length $out) {
+        my $dirty = `git status --porcelain 2>/dev/null`;
+        $out .= '*' if length $dirty;
+    }
+    $cache{$cwd} = { time => $now, value => (length($out) ? $out : undef) };
+    return $cache{$cwd}{value};
+}
+
+sub prompt {
+    my ($self, $continuation) = @_;
+    my $status = $self->{last_status};
+    if ($continuation) {
+        return $self->c('bright_black', '… ') . $self->c('magenta', 'perl') . $self->c('bright_black', ' › ');
+    }
+    my $cwd_real = (defined $ENV{PWD} && -d $ENV{PWD}) ? $ENV{PWD} : getcwd();
+    my $cwd = Nacre::Util::shorten_home($cwd_real);
+    my $host = $ENV{HOSTNAME} || eval { chomp(my $h = `hostname 2>/dev/null`); $h } || 'host';
+    $host =~ s/\..*$//;
+    my $os = Nacre::Util::os_badge();
+    my $branch = $self->git_branch;
+    my $proj = $self->project_badge;
+    my $clock = strftime('%H:%M', localtime);
+    my $dur = $self->{last_duration} > 0.05 ? Nacre::Util::human_duration($self->{last_duration}) : '';
+    my $ok = $status == 0 ? $self->c('green', 'ok') : $self->c('red', "x$status");
+
+    if (($self->{prompt_style} || '') eq 'compact') {
+        my $sig = $status == 0 ? $self->c('green', '❯') : $self->c('red', '❯');
+        my @bits = ($self->c('blue', $cwd));
+        push @bits, $self->c('magenta', $branch) if defined $branch && length $branch;
+        push @bits, $self->c('yellow', $proj) if length $proj;
+        return join(' ', @bits) . ' ' . $sig . ' ';
+    }
+
+    if (($ENV{NACRE_ASCII_PROMPT} || '') eq '1' || ($self->{prompt_style} || '') eq 'classic') {
+        my @bits = ($self->c('cyan', $cwd));
+        push @bits, $self->c('magenta', "git:$branch") if defined $branch && length $branch;
+        push @bits, $self->c('yellow', $proj) if length $proj;
+        push @bits, $self->c('bright_black', $dur) if length $dur;
+        my $sig = $status == 0 ? $self->c('green', '>') : $self->c('red', '>');
+        return join(' ', @bits) . "\n$sig ";
+    }
+
+    my @right;
+    push @right, $self->c('bright_black', $clock);
+    push @right, $self->c('bright_black', $dur) if length $dur;
+    push @right, $ok;
+    my @left = (
+        $self->c('bright_black', 'nacre'),
+        $self->c('bright_black', '@'),
+        $self->c('cyan', $host),
+        $self->c('bright_black', '[') . $self->c('blue', $os) . $self->c('bright_black', ']'),
+        $self->c('blue', $cwd),
+    );
+    push @left, $self->c('magenta', ' ' . $branch) if defined $branch && length $branch;
+    push @left, $self->c('yellow', '[' . $proj . ']') if length $proj;
+    my $top = $self->c('bright_black', '╭─ ') . join(' ', @left) . ' ' . $self->c('bright_black', join(' ', @right));
+    my $sig = $status == 0 ? $self->c('green', '❯') : $self->c('red', '❯');
+    if (!$self->{prompt_newline}) {
+        return join(' ', @left) . ' ' . $self->c('bright_black', join(' ', @right)) . ' ' . $sig . ' ';
+    }
+    return $top . "\n" . $self->c('bright_black', '╰─') . $sig . ' ';
+}
+
+sub prompt_transient {
+    my ($self, $continuation) = @_;
+    my $status = $self->{last_status};
+    if ($continuation) {
+        return $self->c('bright_black', '…') . $self->c('magenta', ' perl') . $self->c('bright_black', ' › ');
+    }
+    my $sig = $status == 0 ? $self->c('green', '❯') : $self->c('red', '❯');
+    if (($ENV{NACRE_ASCII_PROMPT} || '') eq '1' || ($self->{prompt_style} || '') eq 'classic') {
+        $sig = $status == 0 ? $self->c('green', '>') : $self->c('red', '>');
+    }
+    return $sig . ' ';
+}
+
+sub set_terminal_title {
+    my ($self, $title) = @_;
+    return unless $self->{auto_title} && Nacre::Util::is_interactive();
+    return if ($ENV{TERM} || '') eq 'dumb';
+    $title =~ s/[\x00-\x1f\x7f]+/ /g;
+    print "\e]0;$title\a";
+    STDOUT->flush if STDOUT->can('flush');
+}
+
+sub abbrev_expand_line {
+    my ($self, $line) = @_;
+    return $line unless $self->{abbr_expand};
+    return $line unless defined $line && $line =~ /\S/;
+    return $line if $line =~ /\n/;
+    my ($lead, $word, $rest) = $line =~ /^(\s*)(\S+)(.*)$/;
+    return $line unless defined $word && exists $self->{abbrs}{$word};
+    return $lead . $self->{abbrs}{$word} . ($rest // '');
+}
+
+sub path_has_git {
+    my ($self, $path) = @_;
+    state %cache;
+    return $cache{$path} if exists $cache{$path};
+    my $p = $path;
+    while ($p && $p ne '/') {
+        return $cache{$path} = 1 if -d File::Spec->catdir($p, '.git');
+        $p = dirname($p);
+    }
+    return $cache{$path} = 0;
+}
+
+sub execute_text_block {
+    my ($self, $text, %opt) = @_;
+    $text =~ s/\r\n/\n/g;
+    $text =~ s/\r/\n/g;
+
+    my $perl_buf = '';
+    my $perl_depth = 0;
+    my $in_perl_run = 0;
+    my $status = 0;
+
+    my $flush_perl = sub {
+        return 0 unless $perl_buf =~ /\S/;
+        if ($perl_depth > 0) {
+            $self->err('incomplete pasted/script Perl block');
+            $perl_buf = '';
+            $perl_depth = 0;
+            $in_perl_run = 0;
+            return 2;
+        }
+        my $st = $self->execute_perl($perl_buf);
+        $perl_buf = '';
+        $perl_depth = 0;
+        $in_perl_run = 0;
+        return $st;
+    };
+
+    LINE:
+    for my $line (split /\n/, $text, -1) {
+        my $blank_or_comment = ($line =~ /^\s*(?:#.*)?$/);
+
+        if ($in_perl_run) {
+            # Keep pasted Perl programs together as one real Perl compilation
+            # unit. This preserves package declarations, sub definitions, BEGIN
+            # blocks, lexical scope inside the pasted unit, and normal Perl line
+            # numbering. We only flush when a genuinely shell-looking line
+            # appears after the Perl run has balanced its braces.
+            if ($blank_or_comment || $perl_depth > 0 || Nacre::Util::looks_like_perl($line)) {
+                $perl_buf .= $line . "\n";
+                $perl_depth += Nacre::Util::brace_delta($line);
+                next LINE;
+            }
+            $status = $flush_perl->();
+            last if $status != 0 && ($ENV{NACRE_ERREXIT} || '') eq '1';
+        }
+
+        next LINE if $blank_or_comment;
+
+        if (Nacre::Util::looks_like_perl($line)) {
+            $in_perl_run = 1;
+            $perl_buf .= $line . "\n";
+            $perl_depth += Nacre::Util::brace_delta($line);
+            next LINE;
+        }
+
+        $status = $self->execute_line($line, %opt);
+        last if $status != 0 && ($ENV{NACRE_ERREXIT} || '') eq '1';
+    }
+
+    if ($in_perl_run || $perl_buf =~ /\S/) {
+        my $st = $flush_perl->();
+        $status = $st if $st != 0;
+    }
+    return $status;
+}
+
+sub repl {
+    my ($self) = @_;
+    my $ed = Nacre::LineEditor->new(shell => $self, hist_file => Nacre::Util::hist_file());
+    local $SIG{INT} = sub { $self->{last_status} = 130; print "^C\n"; };
+    say $self->c('bright_black', 'Nacre ' . $main::VERSION . ' - Perl-native systems shell. Type help, perl?, or exit.');
+    my $buffer = '';
+    my $depth = 0;
+    eval {
+        while ($self->{running}) {
+            $self->reap_jobs;
+            $self->run_hooks('precmd');
+            $self->set_terminal_title('nacre: ' . Nacre::Util::shorten_home(getcwd()));
+            my $continuation = $depth > 0;
+            my $line = $ed->read_line($self->prompt($continuation), $self->prompt_transient($continuation));
+            last unless defined $line;
+            if ($line eq "\x03") {
+                $buffer = '';
+                $depth = 0;
+                $self->{last_status} = 130;
+                next;
+            }
+            next if $line =~ /^\s*$/ && $depth == 0;
+            $line = $self->abbrev_expand_line($line) if $depth == 0;
+            if (index($line, "\n") >= 0 && $depth == 0) {
+                $ed->add_history($line);
+                $self->execute_text_block($line);
+                next;
+            }
+            if ($depth > 0 || Nacre::Util::looks_like_perl($line)) {
+                $buffer .= $line . "\n";
+                $depth += Nacre::Util::brace_delta($line);
+                next if $depth > 0;
+                $ed->add_history($buffer) if $buffer =~ /\S/;
+                $self->execute_perl($buffer);
+                $buffer = '';
+                $depth = 0;
+                next;
+            }
+            $ed->add_history($line) if $line =~ /\S/;
+            $self->execute_line($line);
+        }
+    };
+    my $err = $@;
+    $ed->disable;
+    $ed->save_history;
+    print "\n" if $err;
+    die $err if $err;
+}
+
+sub setup_completion {
+    my ($self, $term) = @_;
+    my $attribs = eval { $term->Attribs } || return;
+    $attribs->{completion_function} = sub {
+        my ($text, $line, $start, $end) = @_;
+        my @out;
+        if ($start == 0) {
+            my @b = $self->builtin_names;
+            my @a = sort keys %{ $self->{aliases} };
+            my @c = @{ $self->{command_cache} ||= [ Nacre::Util::command_candidates() ] };
+            @out = grep { index($_, $text) == 0 } (@b, @a, @c);
+        } else {
+            my $prefix = length($text) ? $text : '*';
+            @out = glob($prefix . '*');
+        }
+        return @out;
+    };
+}
+
+sub builtin_names {
+    return qw(help perl? perl-runtime exit quit cd pwd pushd popd dirs up take mkcd alias unalias aliases export unset env set history which type source reload jobs fg bg kill mark marks go unmark edit open prompt color transcript sysinfo doctor path try compat version clear cls time highlight hilite);
+}
+
+sub execute_line {
+    my ($self, $line, %opt) = @_;
+    $line = Nacre::Util::trim($line);
+    return 0 unless length $line;
+    my $perlish = Nacre::Util::looks_like_perl($line);
+    $line = $self->abbrev_expand_line($line) unless $perlish || $opt{rc};
+    unless ($opt{quiet} || $opt{rc}) {
+        $self->run_hooks('preexec', $line);
+        $self->set_terminal_title('nacre: ' . $line);
+    }
+    $self->transcript('cmd', $line) unless $opt{quiet};
+    if ($perlish) {
+        return $self->execute_perl($line);
+    }
+    my @items = Nacre::Util::parse_connectors($line);
+    my $last = 0;
+    for my $item (@items) {
+        my ($op, $cmd) = @$item;
+        next if $op eq '&&' && $last != 0;
+        next if $op eq '||' && $last == 0;
+        my $t0 = time;
+        $last = $self->execute_command($cmd, %opt);
+        $self->{last_duration} = time - $t0;
+        $self->{last_status} = $last;
+    }
+    return $last;
+}
+
+sub perl_prelude {
+    my ($self, $source_name) = @_;
+    $source_name ||= '(nacre perl)';
+    my $strict = $self->{strict}
+        ? "use strict; use warnings;\n"
+        : "no strict; no warnings 'once';\n";
+    # This is intentionally not a Perl reimplementation. The user's code below
+    # is fed to CORE::eval in the exact Perl interpreter running Nacre ($^X).
+    # Nacre only decides when a line should enter Perl mode and provides helper
+    # subs in Nacre::User; Perl itself parses/executes my/our/sub/use/for/if/etc.
+    return "package Nacre::User;\n"
+         . "use v5.16;\n"
+         . "use feature qw(say state);\n"
+         . $strict
+         . "#line 1 \"$source_name\"\n";
+}
+
+sub perl_runtime_info {
+    my ($self) = @_;
+    require Config;
+    return {
+        engine     => 'real Perl CORE::eval',
+        executable => $^X,
+        version    => "$^V",
+        numeric    => $],
+        osname     => $Config::Config{osname},
+        archname   => $Config::Config{archname},
+        privlib    => $Config::Config{privlib},
+        package    => 'Nacre::User',
+        strict     => $self->{strict} ? 1 : 0,
+    };
+}
+
+sub execute_perl {
+    my ($self, $code) = @_;
+    $code =~ s/^\s*(?:perl|p)\s*\{//s and $code =~ s/\}\s*$//s;
+    my $expr_mode = ($code =~ s/^\s*=\s*//s) ? 1 : 0;
+    $self->transcript($expr_mode ? 'expr' : 'perl', $code);
+
+    my $wrapped = $self->perl_prelude('(nacre input)');
+    if ($expr_mode) {
+        $wrapped .= 'my $_nacre_rv = do { ' . $code . ' }; '
+                 . 'if (defined $_nacre_rv) { '
+                 . 'if (ref $_nacre_rv) { require Data::Dumper; local $Data::Dumper::Terse=1; print Data::Dumper::Dumper($_nacre_rv); } '
+                 . 'else { print $_nacre_rv, "\\n"; } }' . "\n";
+    } else {
+        $wrapped .= $code . "\n";
+    }
+    my $t0 = time;
+    my $rv = CORE::eval($wrapped);
+    my $err = $@;
+    $self->{last_duration} = time - $t0;
+    if ($err) {
+        chomp $err;
+        $self->err("Perl runtime error: $err");
+        $self->{last_status} = 255;
+        return 255;
+    }
+    $self->{last_status} = 0;
+    return 0;
+}
+
+sub execute_command {
+    my ($self, $line, %opt) = @_;
+    $line = Nacre::Util::trim($line);
+    return 0 unless length $line;
+
+    if ($line =~ /^\|+$/) {
+        $self->err('syntax error: empty pipeline; put a command before and after |');
+        return 2;
+    }
+    if ($line =~ /(^|[^|])\|(?![|])\s*$/) {
+        $self->err('syntax error: pipeline is missing a command after |');
+        return 2;
+    }
+    if ($line =~ /^\s*\|(?![|])/) {
+        $self->err('syntax error: pipeline is missing a command before |');
+        return 2;
+    }
+    if ($line eq '\\') {
+        $self->err('syntax error: lone backslash. Use it at the end of a command to continue, or quote it as "\\".');
+        return 2;
+    }
+
+    if (!$opt{timed_inner} && $line =~ /^time(?:\s+|$)(.*)$/s) {
+        return $self->time_command_line($1, %opt);
+    }
+
+    # Smart cd: a single directory-ish word changes directory. Expand ~ first,
+    # and never try to execute directories like programs.
+    if ($line !~ /\s/ && $line !~ /[|&;<>(){}]/) {
+        my $path = Nacre::Util::expand_path_like($line);
+        if (-d $path) {
+            return $self->builtin_cd(['cd', $path]);
+        }
+    }
+    if ($line =~ /^\.\.\.?\.?$/) {
+        my $ups = length($line) - 1;
+        return $self->builtin_cd(['cd', join('/', ('..') x $ups)]);
+    }
+
+    my $background = 0;
+    if ($line =~ s/\s*&\s*$//) { $background = 1; }
+
+    my @stages = Nacre::Util::split_top_level($line, '|');
+    if (!@stages) {
+        $self->err('syntax error: empty command');
+        return 2;
+    }
+
+    if (@stages == 1 && !$background) {
+        my @tokens = $self->tokens_for($stages[0]);
+        return 2 unless @tokens;
+        @tokens = $self->expand_alias(@tokens);
+        return $self->run_builtin(\@tokens) if $self->is_builtin($tokens[0]);
+        return $self->run_external_pipeline([$self->parse_stage_tokens(@tokens)], $background, $line);
+    }
+
+    my @parsed;
+    for my $stage (@stages) {
+        my @tokens = $self->tokens_for($stage);
+        return 2 unless @tokens;
+        @tokens = $self->expand_alias(@tokens);
+        push @parsed, $self->parse_stage_tokens(@tokens);
+    }
+    return $self->run_external_pipeline(\@parsed, $background, $line);
+}
+
+sub tokens_for {
+    my ($self, $line) = @_;
+    my @tokens;
+    eval { @tokens = shellwords($line); 1 } or do {
+        my $e = $@ || 'parse failed'; chomp $e;
+        $self->err("parse error: $e");
+        return;
+    };
+    return @tokens;
+}
+
+sub expand_alias {
+    my ($self, @tokens) = @_;
+    return @tokens unless @tokens;
+    my $first = $tokens[0];
+    return @tokens unless exists $self->{aliases}{$first};
+    my @alias = $self->tokens_for($self->{aliases}{$first});
+    return (@alias, @tokens[1..$#tokens]);
+}
+
+
+sub expand_arg {
+    my ($self, $word) = @_;
+    return () unless defined $word;
+    $word =~ s/^~(?=\/|$)/Nacre::Util::home()/e;
+    $word =~ s/\$\{([A-Za-z_][A-Za-z0-9_]*)\}/defined $ENV{$1} ? $ENV{$1} : ''/ge;
+    $word =~ s/\$([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_\{])/defined $ENV{$1} ? $ENV{$1} : ''/ge;
+    if ($word =~ /[*?\[]/) {
+        my @g = glob($word);
+        return @g if @g;
+    }
+    return ($word);
+}
+
+sub parse_stage_tokens {
+    my ($self, @tokens) = @_;
+    my %stage = (argv => [], env => {}, stdin => undef, stdout => undef, stderr => undef, append_out => 0, append_err => 0, merge_err => 0, parse_error => undef);
+    my $need_target = sub {
+        my ($op) = @_;
+        unless (@tokens) { $stage{parse_error} = "syntax error: redirection $op needs a target"; return undef; }
+        return shift @tokens;
+    };
+    while (@tokens) {
+        my $t = shift @tokens;
+        if ($t =~ /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/ && @{ $stage{argv} } == 0) {
+            $stage{env}{$1} = $2;
+        } elsif ($t eq '<') {
+            my $target = $need_target->($t); last unless defined $target; $stage{stdin} = $self->expand_arg($target);
+        } elsif ($t eq '>' || $t eq '1>') {
+            my $target = $need_target->($t); last unless defined $target; $stage{stdout} = $self->expand_arg($target); $stage{append_out} = 0;
+        } elsif ($t eq '>>' || $t eq '1>>') {
+            my $target = $need_target->($t); last unless defined $target; $stage{stdout} = $self->expand_arg($target); $stage{append_out} = 1;
+        } elsif ($t eq '2>') {
+            my $target = $need_target->($t); last unless defined $target; $stage{stderr} = $self->expand_arg($target); $stage{append_err} = 0;
+        } elsif ($t eq '2>>') {
+            my $target = $need_target->($t); last unless defined $target; $stage{stderr} = $self->expand_arg($target); $stage{append_err} = 1;
+        } elsif ($t eq '&>') {
+            my $target = $need_target->($t); last unless defined $target; $stage{stdout} = $self->expand_arg($target); $stage{merge_err} = 1;
+        } else {
+            push @{ $stage{argv} }, $self->expand_arg($t);
+        }
+    }
+    return \%stage;
+}
+
+sub is_builtin {
+    my ($self, $cmd) = @_;
+    state %built = map { $_ => 1 } $self->builtin_names;
+    return $built{$cmd} || 0;
+}
+
+sub run_builtin {
+    my ($self, $tokens) = @_;
+    my $cmd = $tokens->[0];
+    my %map = (
+        'help' => 'builtin_help', 'perl?' => 'builtin_perl_help', 'perl-runtime' => 'builtin_perl_runtime',
+        'exit' => 'builtin_exit', 'quit' => 'builtin_exit',
+        'cd' => 'builtin_cd', 'pwd' => 'builtin_pwd', 'pushd' => 'builtin_pushd', 'popd' => 'builtin_popd', 'dirs' => 'builtin_dirs', 'up' => 'builtin_up', 'take' => 'builtin_take', 'mkcd' => 'builtin_take',
+        'alias' => 'builtin_alias', 'unalias' => 'builtin_unalias', 'aliases' => 'builtin_aliases',
+        'export' => 'builtin_export', 'unset' => 'builtin_unset', 'env' => 'builtin_env', 'set' => 'builtin_set',
+        'history' => 'builtin_history', 'which' => 'builtin_which', 'type' => 'builtin_type',
+        'source' => 'builtin_source', 'reload' => 'builtin_reload',
+        'jobs' => 'builtin_jobs', 'fg' => 'builtin_fg', 'bg' => 'builtin_bg', 'kill' => 'builtin_kill',
+        'mark' => 'builtin_mark', 'marks' => 'builtin_marks', 'go' => 'builtin_go', 'unmark' => 'builtin_unmark',
+        'edit' => 'builtin_edit', 'open' => 'builtin_open',
+        'prompt' => 'builtin_prompt', 'color' => 'builtin_color', 'transcript' => 'builtin_transcript',
+        'sysinfo' => 'builtin_sysinfo', 'doctor' => 'builtin_doctor', 'path' => 'builtin_path', 'try' => 'builtin_try', 'compat' => 'builtin_compat',
+        'version' => 'builtin_version', 'clear' => 'builtin_clear', 'cls' => 'builtin_clear', 'time' => 'builtin_time', 'highlight' => 'builtin_highlight', 'hilite' => 'builtin_highlight',
+    );
+    my $meth = $map{$cmd};
+    return $self->$meth($tokens);
+}
+
+sub run_external_pipeline {
+    my ($self, $stages, $background, $line) = @_;
+    return 0 unless @$stages;
+    my @pids;
+    my $prev_read;
+    for my $i (0 .. $#$stages) {
+        my $stage = $stages->[$i];
+        if ($stage->{parse_error}) { $self->err($stage->{parse_error}); return 2; }
+        my @argv = @{ $stage->{argv} || [] };
+        unless (@argv) { $self->err('syntax error: empty pipeline stage'); return 2; }
+        if (-d $argv[0]) {
+            $self->err("nacre: $argv[0]: is a directory; use cd $argv[0]");
+            return 126;
+        }
+        my ($read, $write);
+        if ($i < $#$stages) { pipe($read, $write) or do { $self->err("pipe failed: $!"); return 125; }; }
+        my $pid = fork();
+        if (!defined $pid) { $self->err("fork failed: $!"); return 125; }
+        if ($pid == 0) {
+            # Child. Restore default interactive signals so Ctrl-C kills the foreground command, not Nacre.
+            $SIG{INT} = 'DEFAULT';
+            $SIG{QUIT} = 'DEFAULT';
+            $SIG{TERM} = 'DEFAULT';
+            if (defined $prev_read) { open STDIN, '<&', $prev_read or die "dup stdin: $!"; }
+            if ($i < $#$stages) { open STDOUT, '>&', $write or die "dup stdout: $!"; }
+            if ($stage->{stdin}) { open STDIN, '<', $stage->{stdin} or die "open < $stage->{stdin}: $!\n"; }
+            if ($stage->{stdout}) { open STDOUT, ($stage->{append_out} ? '>>' : '>'), $stage->{stdout} or die "open > $stage->{stdout}: $!\n"; }
+            if ($stage->{stderr}) { open STDERR, ($stage->{append_err} ? '>>' : '>'), $stage->{stderr} or die "open 2> $stage->{stderr}: $!\n"; }
+            if ($stage->{merge_err}) { open STDERR, '>&', STDOUT or die "merge stderr: $!"; }
+            close $prev_read if defined $prev_read;
+            close $read if defined $read;
+            close $write if defined $write;
+            local %ENV = (%ENV, %{ $stage->{env} || {} });
+            if ($self->is_builtin($argv[0])) {
+                my $code = $self->run_builtin(\@argv);
+                exit($code || 0);
+            }
+            {
+                no warnings 'exec';
+                exec { $argv[0] } @argv;
+            }
+            my $e = $!;
+            print STDERR "nacre: $argv[0]: $e\n";
+            exit($e =~ /No such file/ ? 127 : 126);
+        }
+        push @pids, $pid;
+        close $prev_read if defined $prev_read;
+        close $write if defined $write;
+        $prev_read = $read;
+    }
+    close $prev_read if defined $prev_read;
+
+    if ($background) {
+        my $id = $self->{job_seq}++;
+        $self->{jobs}{$id} = { pids => \@pids, command => $line, start => time, status => 'running' };
+        say '[' . $id . '] ' . join(' ', @pids) . '  ' . $line;
+        return 0;
+    }
+
+    my $status = 0;
+    my $interrupted = 0;
+    {
+        local $SIG{INT} = sub {
+            $interrupted = 1;
+            kill 'INT', @pids;
+        };
+        local $SIG{QUIT} = sub {
+            $interrupted = 1;
+            kill 'QUIT', @pids;
+        };
+        for my $pid (@pids) {
+            my $r;
+            do { $r = waitpid($pid, 0); } while $r == -1 && $!{EINTR};
+            if ($? & 127) { $status = 128 + ($? & 127); }
+            elsif (($? >> 8) != 0) { $status = $? >> 8; }
+        }
+    }
+    print STDERR "^C\n" if $interrupted && Nacre::Util::is_interactive();
+    if ($status == 127) {
+        my $cmd = $stages->[0]{argv}[0];
+        $self->suggest_command($cmd);
+    } elsif ($status != 0) {
+        $self->smart_error_hint($line, $status);
+    }
+    return $status;
+}
+
+sub capture_line {
+    my ($self, @cmd) = @_;
+    my $line = @cmd > 1 ? Nacre::Util::sh_join(@cmd) : ($cmd[0] // '');
+    my @stages = Nacre::Util::split_top_level($line, '|');
+    return '' unless @stages;
+    my $last = $stages[-1];
+    my $tmp = File::Spec->catfile(Nacre::Util::cache_dir(), 'capture.' . $$ . '.' . int(rand(1_000_000)));
+    $stages[-1] = $last . ' > ' . Nacre::Util::shell_quote($tmp);
+    $self->execute_command(join(' | ', @stages), quiet => 1);
+    my $out = -f $tmp ? Nacre::Util::file_slurp($tmp) : '';
+    unlink $tmp;
+    return $out;
+}
+
+sub compat_shell {
+    my ($self, $line) = @_;
+    my $shell = $self->{compat_shell};
+    my $pid = fork();
+    if (!defined $pid) { $self->err("fork failed: $!"); return 125; }
+    if ($pid == 0) {
+        $SIG{INT} = 'DEFAULT';
+        $SIG{QUIT} = 'DEFAULT';
+        unless (exec {$shell} $shell, '-c', $line) {
+            print STDERR "nacre: compat: $shell: $!\n";
+            exit 127;
+        }
+    }
+    my $interrupted = 0;
+    local $SIG{INT} = sub { $interrupted = 1; kill 'INT', $pid; };
+    waitpid($pid, 0);
+    print STDERR "^C\n" if $interrupted && Nacre::Util::is_interactive();
+    return ($? & 127) ? 128 + ($? & 127) : ($? >> 8);
+}
+
+sub suggest_command {
+    my ($self, $cmd) = @_;
+    my @cands = ($self->builtin_names, keys %{ $self->{aliases} }, Nacre::Util::command_candidates());
+    my @s = Nacre::Util::best_suggestions($cmd, @cands);
+    if (@s) {
+        $self->warnx("command not found: $cmd. Did you mean: " . join(', ', @s) . '?');
+    } else {
+        $self->warnx("command not found: $cmd");
+    }
+}
+
+sub smart_error_hint {
+    my ($self, $line, $status) = @_;
+    return if $status == 0;
+    my @h;
+    push @h, 'Permission denied usually means chmod +x, sudo, ownership, or a mounted noexec filesystem.' if $status == 126;
+    push @h, 'Cargo weirdness: if `cargo run --release` is being parsed by rustup, check `which cargo` and your PATH ordering.' if $line =~ /cargo\s+run\s+--release/;
+    push @h, 'CMake flags use -DNAME=VALUE. A missing `=` turns into cursed command-line soup.' if $line =~ /cmake/;
+    push @h, 'Git conflict state: run `git status`, resolve conflict markers, then `git add` and commit.' if $line =~ /git\s+(?:pull|merge|rebase)/;
+    push @h, 'If this is PipeWire/WirePlumber: check `wpctl status`, user services, and whether the ALSA/Pulse bridge package is installed.' if $line =~ /pipewire|wireplumber|wpctl|pactl/;
+    push @h, 'Exherbo cave failures often need the exact slot/target. Try `cave show`, `cave resolve -x world`, or inspect the chosen repository.' if $line =~ /\bcave\b/;
+    push @h, 'NetworkManager unmanaged Wi-Fi usually points to missing wifi plugin, wpa_supplicant/iwd setup, or a config marking the interface unmanaged.' if $line =~ /nmcli|NetworkManager/i;
+    return unless @h;
+    say STDERR $self->c('bright_black', 'hint') . '  ' . $_ for @h[0 .. (@h > 1 ? 1 : 0)];
+}
+
+# -----------------------------------------------------------------------------
+# Builtins
+# -----------------------------------------------------------------------------
+
+sub builtin_help {
+    my ($self, $t) = @_;
+    my $topic = $t->[1] || '';
+    if ($topic eq 'run') {
+        say "run commands normally: ls -la | grep rs > files.txt";
+        say "Perl control-flow is native: for my \$f (files '*.rs') { run('wc -l', \$f) }";
+        return 0;
+    }
+    if ($topic eq 'rc') {
+        say $self->c('bold', 'Perl rc file');
+        say '  canonical: ' . Nacre::Util::rc_file();
+        say '  home dotfile: ' . Nacre::Util::dot_rc_file();
+        say '  legacy fallback: ' . Nacre::Util::legacy_rc_file();
+        say "  option transient_prompt => 1;";
+        say "  option ghost_text => 1;";
+        say "  alias ll => 'ls -lah';";
+        say "  abbr g => 'git';";
+        say "  on preexec => sub { my (\$line) = \@_; };";
+        return 0;
+    }
+    say $self->c('bold', 'Nacre shell');
+    say "  Normal commands:   ls -lah | grep rs > out.txt";
+    say "  Perl in shell:     for my \$f (files '*.pl') { say \$f; run('perl', '-c', \$f) }";
+    say "  Inline helpers:    run(...), capture(...), cd(...), files(...), slurp(...), spew(...)";
+    say "";
+    say $self->c('bold', 'Interactive UX');
+    say "  ghost text:        history/command/file prediction; Right or Ctrl-F accepts";
+    say "  transient prompt:  enable with option transient_prompt => 1 in rc";
+    say "  paste:             bracketed paste waits for Enter";
+    say "  keys:              Ctrl-L clear, Ctrl-C cancel/interrupt, Tab complete";
+    say "";
+    say $self->c('bold', 'Core builtins');
+    say "  cd pwd pushd popd dirs up take mark go marks open edit";
+    say "  alias unalias aliases export unset env path history which type";
+    say "  jobs fg bg kill doctor sysinfo try compat source reload prompt color transcript";
+    say "  version clear time highlight perl-runtime";
+    say "";
+    say "Try: perl?    help run    help rc    doctor .";
+    return 0;
+}
+
+sub builtin_perl_runtime {
+    my ($self, $t) = @_;
+    my $i = $self->perl_runtime_info;
+    say $self->c('bold', 'Real Perl runtime');
+    say "  engine:      $i->{engine}";
+    say "  executable:  $i->{executable}";
+    say "  version:     $i->{version} ($i->{numeric})";
+    say "  os/arch:     $i->{osname} / $i->{archname}";
+    say "  privlib:     $i->{privlib}";
+    say "  package:     $i->{package}";
+    say "  strict mode: " . ($i->{strict} ? 'on' : 'off');
+    say "";
+    say "Nacre does not implement Perl syntax. It routes Perl-looking input into CORE::eval.";
+    say "Perl itself parses my/our/sub/use/package/for/if/regex/etc.";
+    return 0;
+}
+
+sub builtin_perl_help {
+    my ($self, $t) = @_;
+    say $self->c('bold', 'Perl mode');
+    say "  Lines beginning with Perl keywords/elements are executed by real Perl via CORE::eval inside package Nacre::User.";
+    say "";
+    say "Examples:";
+    say "  \$x = 5";
+    say "  say \$x * 10";
+    say "  for my \$f (files '*.txt') { say \$f }";
+    say "  if (-e 'Cargo.toml') { run('cargo check') }";
+    say "  my \$out = capture('git status --short'); say \$out";
+    say "";
+    say "Helpers:";
+    say "  run('ls -la')          run a Nacre command line";
+    say "  run('wc','-l','x')     run direct argv safely";
+    say "  sh('echo \$SHELL')      run through compatibility shell";
+    say "  capture('cmd')         return stdout";
+    say "  cd('dir'), pwd(), files('*.rs'), slurp('file'), spew('file', \$text), append(...)";
+    return 0;
+}
+
+sub builtin_exit { my ($self, $t) = @_; $self->{running} = 0; return defined $t->[1] ? int($t->[1]) : 0 }
+sub builtin_pwd { say ((defined $ENV{PWD} && -d $ENV{PWD}) ? $ENV{PWD} : getcwd()); return 0 }
+
+sub builtin_cd {
+    my ($self, $t) = @_;
+    my $dir = $t->[1] // Nacre::Util::home();
+    $dir = $ENV{OLDPWD} if defined($dir) && $dir eq '-';
+    $dir = Nacre::Util::expand_path_like($dir);
+    my $old_logical = (defined $ENV{PWD} && -d $ENV{PWD}) ? $ENV{PWD} : getcwd();
+    if (chdir $dir) {
+        $ENV{OLDPWD} = $old_logical;
+        my $new_logical;
+        if (File::Spec->file_name_is_absolute($dir)) {
+            $new_logical = $dir;
+        } else {
+            $new_logical = File::Spec->catdir($old_logical, $dir);
+        }
+        my @parts;
+        for my $part (File::Spec->splitdir($new_logical)) {
+            next if !defined($part) || $part eq '' || $part eq '.';
+            if ($part eq '..') { pop @parts if @parts; next; }
+            push @parts, $part;
+        }
+        $new_logical = ($new_logical =~ m{^/}) ? '/' . join('/', @parts) : join('/', @parts);
+        $new_logical = '/' if $new_logical eq '';
+        $ENV{PWD} = $new_logical;
+        return 0;
+    }
+    $self->err("cd: $dir: $!"); return 1;
+}
+sub builtin_pushd { my ($self, $t) = @_; push @{ $self->{dirs} }, getcwd(); return $self->builtin_cd(['cd', $t->[1] // Nacre::Util::home()]); }
+sub builtin_popd { my ($self, $t) = @_; my $dir = pop @{ $self->{dirs} }; return $self->builtin_cd(['cd', $dir]) if defined $dir; $self->warnx('directory stack empty'); return 1; }
+sub builtin_dirs { my ($self) = @_; say join(' ', map { Nacre::Util::shorten_home($_) } reverse @{ $self->{dirs} }); return 0; }
+sub builtin_up { my ($self, $t) = @_; my $n = $t->[1] || 1; return $self->builtin_cd(['cd', join('/', ('..') x $n)]); }
+sub builtin_take { my ($self, $t) = @_; my $dir = $t->[1] or do { $self->err('usage: take DIR'); return 2; }; make_path($dir); return $self->builtin_cd(['cd', $dir]); }
+
+sub builtin_alias {
+    my ($self, $t) = @_;
+    if (@$t == 1) { return $self->builtin_aliases($t); }
+    my $raw = join(' ', @$t[1..$#$t]);
+    my ($name, $value) = $raw =~ /^([A-Za-z_][\w.-]*)=(.*)$/ ? ($1, $2) : ($t->[1], join(' ', @$t[2..$#$t]));
+    unless (defined $name && length $name && defined $value && length $value) { $self->err('usage: alias name=command'); return 2; }
+    $value =~ s/^(['"])(.*)\1$/$2/;
+    $self->{aliases}{$name} = $value;
+    $self->save_aliases;
+    return 0;
+}
+sub builtin_unalias { my ($self, $t) = @_; delete $self->{aliases}{$t->[1] // ''}; $self->save_aliases; return 0; }
+sub builtin_aliases { my ($self) = @_; say "$_=" . Nacre::Util::shell_quote($self->{aliases}{$_}) for sort keys %{ $self->{aliases} }; return 0; }
+
+sub builtin_export {
+    my ($self, $t) = @_;
+    for my $pair (@$t[1..$#$t]) { my ($k,$v) = split /=/, $pair, 2; $ENV{$k} = defined $v ? $v : ($ENV{$k} // ''); }
+    return 0;
+}
+sub builtin_unset { my ($self, $t) = @_; delete @ENV{@$t[1..$#$t]}; return 0; }
+sub builtin_env { for my $k (sort keys %ENV) { say "$k=$ENV{$k}" } return 0; }
+sub builtin_set { my ($self, $t) = @_; say "last_status=$self->{last_status}"; say "prompt_style=$self->{prompt_style}"; say "transient_prompt=$self->{transient_prompt}"; say "ghost_text=$self->{ghost_text}"; say "ghost_color=$self->{ghost_color}"; say "compat_shell=$self->{compat_shell}"; say "rc_file=" . Nacre::Util::rc_file(); say "dot_rc_file=" . Nacre::Util::dot_rc_file(); say "legacy_rc_file=" . Nacre::Util::legacy_rc_file(); say "nacre_home=" . Nacre::Util::config_dir(); return 0; }
+
+sub builtin_history {
+    my ($self, $t) = @_;
+    my $file = Nacre::Util::hist_file();
+    return 0 unless -f $file;
+    open my $fh, '<', $file or return 1;
+    my @lines = <$fh>; close $fh;
+    my $n = $t->[1] || 30;
+    my $start = @lines > $n ? @lines - $n : 0;
+    for my $i ($start .. $#lines) { printf "%5d  %s", $i + 1, $lines[$i]; }
+    return 0;
+}
+sub builtin_which { my ($self, $t) = @_; for my $cmd (@$t[1..$#$t]) { say Nacre::Util::which($cmd) // "$cmd not found"; } return 0; }
+sub builtin_type {
+    my ($self, $t) = @_;
+    for my $cmd (@$t[1..$#$t]) {
+        if ($self->is_builtin($cmd)) { say "$cmd is a nacre builtin"; }
+        elsif (exists $self->{aliases}{$cmd}) { say "$cmd is aliased to `$self->{aliases}{$cmd}`"; }
+        else { say Nacre::Util::which($cmd) // "$cmd not found"; }
+    }
+    return 0;
+}
+
+sub builtin_source {
+    my ($self, $t) = @_;
+    my $file = $t->[1] or do { $self->err('usage: source FILE'); return 2; };
+    open my $fh, '<', $file or do { $self->err("source: $file: $!"); return 1; };
+    while (my $line = <$fh>) { chomp $line; next if $line =~ /^\s*(?:#|$)/; $self->execute_line($line, rc => 1); }
+    close $fh;
+    return 0;
+}
+sub builtin_reload { my ($self) = @_; $self->load_state; $self->load_rc; return 0; }
+
+sub reap_jobs {
+    my ($self) = @_;
+    for my $id (keys %{ $self->{jobs} }) {
+        my $job = $self->{jobs}{$id};
+        next unless $job->{status} eq 'running';
+        my $done = 1;
+        for my $pid (@{ $job->{pids} }) {
+            my $r = waitpid($pid, WNOHANG);
+            $done = 0 if $r == 0;
+        }
+        if ($done) { $job->{status} = 'done'; say '[' . $id . '] done  ' . $job->{command} if Nacre::Util::is_interactive(); }
+    }
+}
+sub builtin_jobs { my ($self) = @_; for my $id (sort { $a <=> $b } keys %{ $self->{jobs} }) { my $j=$self->{jobs}{$id}; say "[$id] $j->{status}\t$j->{command}"; } return 0; }
+sub builtin_fg { my ($self, $t) = @_; my $id = $t->[1] || (sort {$b<=>$a} keys %{ $self->{jobs} })[0]; my $j = $self->{jobs}{$id} or do { $self->err('fg: no such job'); return 1; }; waitpid($_, 0) for @{ $j->{pids} }; delete $self->{jobs}{$id}; return $? >> 8; }
+sub builtin_bg { my ($self) = @_; $self->warnx('background jobs already continue automatically'); return 0; }
+sub builtin_kill { my ($self, $t) = @_; my $target = $t->[1] or do { $self->err('usage: kill PID|%JOB'); return 2; }; if ($target =~ /^%(\d+)/) { my $j=$self->{jobs}{$1} or return 1; kill 'TERM', @{ $j->{pids} }; return 0; } kill 'TERM', $target; return 0; }
+
+sub builtin_mark { my ($self, $t) = @_; my $name = $t->[1] or do { $self->err('usage: mark NAME [DIR]'); return 2; }; $self->{marks}{$name} = abs_path($t->[2] || getcwd()); $self->save_marks; return 0; }
+sub builtin_marks { my ($self) = @_; say "$_\t" . Nacre::Util::shorten_home($self->{marks}{$_}) for sort keys %{ $self->{marks} }; return 0; }
+sub builtin_go { my ($self, $t) = @_; my $name = $t->[1] or do { $self->err('usage: go NAME'); return 2; }; return $self->builtin_cd(['cd', $self->{marks}{$name} // $name]); }
+sub builtin_unmark { my ($self, $t) = @_; delete $self->{marks}{$t->[1] // ''}; $self->save_marks; return 0; }
+
+sub builtin_edit { my ($self, $t) = @_; my $ed = $ENV{EDITOR} || 'nano'; my @files = @$t[1..$#$t]; @files = ('.') unless @files; system($ed, @files); return $? >> 8; }
+sub builtin_open { my ($self, $t) = @_; my @targets = @$t[1..$#$t]; @targets = ('.') unless @targets; my $op = Nacre::Util::which('xdg-open') || Nacre::Util::which('open'); unless ($op) { $self->err('no xdg-open/open found'); return 1; } system($op, $_) for @targets; return 0; }
+sub builtin_prompt { my ($self, $t) = @_; $self->{prompt_style} = $t->[1] if $t->[1]; say "prompt_style=$self->{prompt_style}"; return 0; }
+sub builtin_color { my ($self, $t) = @_; my $m = $t->[1] || ''; if ($m =~ /^(auto|always|never)$/) { $self->{color_mode}=$m; $self->{color}=Nacre::Util::supports_color($m); } say "color=$self->{color_mode}"; return 0; }
+sub builtin_transcript { my ($self, $t) = @_; my $arg = $t->[1] || ''; if ($arg eq 'on') { $self->{transcript}=1 } elsif ($arg eq 'off') { $self->{transcript}=0 } elsif ($arg eq 'path') { say Nacre::Util::transcript_file(); return 0 } say 'transcript=' . ($self->{transcript} ? 'on' : 'off'); return 0; }
+
+sub builtin_sysinfo {
+    my ($self) = @_;
+    my $host = `hostname 2>/dev/null`; chomp $host;
+    my $kernel = `uname -srmo 2>/dev/null`; chomp $kernel;
+    say $self->c('bold', 'system');
+    say "  host:   $host" if $host;
+    say "  kernel: $kernel" if $kernel;
+    say "  shell:  nacre $main::VERSION";
+    say "  cwd:    " . getcwd();
+    my $mem = eval { Nacre::Util::file_slurp('/proc/meminfo') } || '';
+    if ($mem =~ /^MemTotal:\s+(\d+)/m) { say sprintf "  ram:    %.1f GiB", $1 / 1024 / 1024; }
+    system('df', '-h', '.') if Nacre::Util::which('df');
+    return 0;
+}
+
+sub builtin_doctor {
+    my ($self, $t) = @_;
+    my $dir = $t->[1] || '.';
+    unless (-d $dir) { $self->err("doctor: not a directory: $dir"); return 1; }
+    my $old = getcwd(); chdir $dir or return 1;
+    my @findings;
+    push @findings, ['Rust', 'Cargo.toml', ['cargo check', 'cargo run', 'cargo build --release']] if -f 'Cargo.toml';
+    push @findings, ['CMake', 'CMakeLists.txt', ['cmake -S . -B build -G Ninja', 'cmake --build build']] if -f 'CMakeLists.txt';
+    push @findings, ['Meson', 'meson.build', ['meson setup build', 'meson compile -C build']] if -f 'meson.build';
+    push @findings, ['Make', 'Makefile', ['make', 'make clean']] if -f 'Makefile';
+    push @findings, ['Node', 'package.json', ['npm install', 'npm run dev', 'npm test']] if -f 'package.json';
+    push @findings, ['Python', 'pyproject.toml/requirements.txt', ['python -m venv .venv', 'python -m pytest']] if -f 'pyproject.toml' || -f 'requirements.txt';
+    push @findings, ['Perl', 'Makefile.PL/cpanfile', ['perl Makefile.PL', 'make test']] if -f 'Makefile.PL' || -f 'cpanfile';
+    push @findings, ['Godot', 'project.godot', ['godot4 --editor', 'godot4']] if -f 'project.godot';
+    if (!@findings) { say $self->c('yellow', 'No obvious project type detected.'); chdir $old; return 1; }
+    for my $f (@findings) {
+        say $self->c('bold', $f->[0]) . " project detected via $f->[1]";
+        say "  $_" for @{ $f->[2] };
+    }
+    chdir $old;
+    return 0;
+}
+
+sub builtin_path {
+    my ($self, $t) = @_;
+    my $op = $t->[1] || 'show';
+    if ($op eq 'show') { say $_ for split /:/, $ENV{PATH} || ''; return 0; }
+    if ($op eq 'add') { my $d=$t->[2] or return 2; $ENV{PATH} = "$d:" . ($ENV{PATH} || ''); return 0; }
+    if ($op eq 'rm') { my $d=$t->[2] or return 2; $ENV{PATH} = join ':', grep { $_ ne $d } split /:/, $ENV{PATH} || ''; return 0; }
+    $self->err('usage: path show|add DIR|rm DIR'); return 2;
+}
+
+sub builtin_try { my ($self, $t) = @_; my $line = join ' ', @$t[1..$#$t]; say $self->c('bright_black', 'dry-run: ') . $line; return 0; }
+sub builtin_compat { my ($self, $t) = @_; my $line = join ' ', @$t[1..$#$t]; return $self->compat_shell($line); }
+sub builtin_version { say "nacre $main::VERSION"; return 0; }
+
+sub builtin_clear {
+    my ($self, $t) = @_;
+    my $scrollback = 1;
+    for my $a (@$t[1..$#$t]) {
+        if ($a eq '-x' || $a eq '--screen-only') { $scrollback = 0; }
+        elsif ($a eq '-s' || $a eq '--scrollback') { $scrollback = 1; }
+        elsif ($a eq '-h' || $a eq '--help') {
+            say "usage: clear [--screen-only|-x] [--scrollback|-s]";
+            say "default clears screen + scrollback, resets colors, homes cursor, shows cursor";
+            return 0;
+        } else { $self->err("clear: unknown option: $a"); return 2; }
+    }
+    print Nacre::Util::clear_sequence(scrollback => $scrollback);
+    return 0;
+}
+
+sub format_time_value {
+    my ($self, $s, $posix) = @_;
+    return sprintf('%.2f', $s) if $posix;
+    my $m = int($s / 60);
+    my $r = $s - $m * 60;
+    return sprintf('%dm%.3fs', $m, $r);
+}
+
+sub time_command_line {
+    my ($self, $line, %opt) = @_;
+    $line = Nacre::Util::trim($line // '');
+    my $posix = 0;
+    if ($line =~ s/^\s*-p\s+//) { $posix = 1; }
+    $line =~ s/^--\s+//;
+    if ($line eq '' || $line eq '--help' || $line eq '-h') {
+        say "usage: time [-p] -- COMMAND";
+        say "prints bash-like real/user/sys timings for a Nacre command line";
+        return 0;
+    }
+    my @t0 = times;
+    my $r0 = time;
+    my $status = $self->execute_line($line, %opt, timed_inner => 1);
+    my $real = time - $r0;
+    my @t1 = times;
+    my $user = ($t1[0] - $t0[0]) + ($t1[2] - $t0[2]);
+    my $sys  = ($t1[1] - $t0[1]) + ($t1[3] - $t0[3]);
+    my $label = $self->{color} ? sub { $self->c('bright_black', $_[0]) } : sub { $_[0] };
+    print STDERR $label->('real') . " " . $self->format_time_value($real, $posix) . "\n";
+    print STDERR $label->('user') . " " . $self->format_time_value($user, $posix) . "\n";
+    print STDERR $label->('sys ') . " " . $self->format_time_value($sys, $posix) . "\n";
+    return $status;
+}
+
+sub builtin_time {
+    my ($self, $t) = @_;
+    my $line = join ' ', @$t[1..$#$t];
+    return $self->time_command_line($line);
+}
+
+sub builtin_highlight {
+    my ($self, $t) = @_;
+    my $file = $t->[1] or do { $self->err('usage: highlight FILE'); return 2; };
+    open my $fh, '<', $file or do { $self->err("highlight: $file: $!"); return 1; };
+    my $ed = Nacre::LineEditor->new(shell => $self, hist_file => undef);
+    while (my $line = <$fh>) {
+        chomp $line;
+        say $ed->highlighted($line);
+    }
+    close $fh;
+    return 0;
+}
+
+1;
+
+package main;
+use strict;
+use warnings;
+use v5.16;
+use feature qw(say);
+
+sub usage {
+    print <<'USAGE';
+Nacre - Perl-native systems shell
+
+Usage:
+  nacre [options]
+  nacre -c 'command'
+  nacre --script file.nacre
+
+Options:
+  -c, --command CMD       Run one Nacre command line and exit
+  --script FILE           Run a file of Nacre/Perl-shell lines
+  --no-rc                 Do not read ~/.config/nacre/nacrerc.perl or ~/.nacrerc.perl
+  --color MODE            auto, always, never
+  --plain                 Same as --color never
+  --strict                Disable compatibility conveniences in future versions
+  --version               Print version
+  -h, --help              Show this help
+
+Examples:
+  nacre
+  nacre -c 'doctor .'
+  nacre -c 'for my $f (files "*.pl") { run("perl", "-c", $f) }'
+USAGE
+}
+
+sub main {
+    Nacre::Util::enable_autoflush();
+    my @args = @ARGV;
+    my $cmd;
+    my $script;
+    my $no_rc = 0;
+    my $color = 'auto';
+    my $strict = 0;
+    my $help = 0;
+    my $version = 0;
+    GetOptionsFromArray(\@args,
+        'c|command=s' => \$cmd,
+        'script=s' => \$script,
+        'no-rc' => \$no_rc,
+        'color=s' => \$color,
+        'plain' => sub { $color = 'never' },
+        'strict' => \$strict,
+        'version' => \$version,
+        'h|help' => \$help,
+    ) or do { usage(); exit 2; };
+    if ($help) { usage(); exit 0; }
+    if ($version) { say "nacre $VERSION"; exit 0; }
+    $color = 'auto' unless $color =~ /^(?:auto|always|never)$/;
+    my $shell = Nacre::Core->new(color_mode => $color, no_rc => $no_rc, strict => $strict);
+    if (defined $cmd) {
+        my $status = (index($cmd, "\n") >= 0) ? $shell->execute_text_block($cmd) : $shell->execute_line($cmd);
+        exit($status || 0);
+    }
+    if (defined $script) {
+        open my $fh, '<', $script or die "nacre: cannot read $script: $!\n";
+        local $/;
+        my $text = <$fh>;
+        close $fh;
+        my $status = $shell->execute_text_block($text);
+        exit($status || 0);
+    }
+    if (!-t STDIN) {
+        local $/;
+        my $text = <STDIN>;
+        my $status = $shell->execute_text_block($text // '');
+        exit($status || 0);
+    }
+    $shell->repl;
+    exit($shell->{last_status} || 0);
+}
+
+main();

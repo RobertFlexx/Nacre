@@ -1,0 +1,478 @@
+.Dd June 9, 2026
+.Dt NACRE 1
+.Os
+.Sh NAME
+.Nm nacre
+.Nd Perl-native interactive shell for development work
+.Sh SYNOPSIS
+.Nm
+.Op Fl h
+.Op Fl Fl help
+.Nm
+.Op Fl Fl plain
+.Op Fl Fl no-rc
+.Op Fl Fl color Ar auto|always|never
+.Op Fl Fl strict
+.Nm
+.Op Fl Fl plain
+.Op Fl Fl no-rc
+.Op Fl c Ar command
+.Nm
+.Op Fl Fl plain
+.Op Fl Fl no-rc
+.Fl Fl script Ar file
+.Sh DESCRIPTION
+.Nm
+is an interactive shell for Unix-like systems.
+Normal command lines run as
+normal programs, while scripting and configuration use real Perl through
+.Fn CORE::eval
+in the Perl interpreter running Nacre.
+.Pp
+The shell is designed for daily development work.
+It includes pipelines,
+redirection, background jobs, aliases, abbreviations, marks, history,
+bracketed paste, ghost suggestions, project detection, timing helpers, and a
+Perl rc file.
+.Pp
+.Nm
+is not a POSIX shell replacement.
+Do not install it as
+.Pa /bin/sh
+and do not use it for boot-critical scripts or software that requires exact
+POSIX shell behavior.
+.Sh OPTIONS
+.Bl -tag -width Ds
+.It Fl c Ar command , Fl Fl command Ar command
+Run one Nacre command line and exit.
+If
+.Ar command
+contains newlines, it is evaluated as a text block.
+.It Fl Fl script Ar file
+Read and execute a file containing Nacre command lines and Perl-mode lines.
+.It Fl Fl no-rc
+Start without reading the user rc files.
+.It Fl Fl color Ar mode
+Set color handling.
+Valid modes are
+.Cm auto ,
+.Cm always ,
+and
+.Cm never .
+.It Fl Fl plain
+Use plain output.
+This is equivalent to
+.Fl Fl color Cm never
+and is useful for scripts, tests, and logs.
+.It Fl Fl strict
+Enable stricter behavior for compatibility checks reserved for future versions.
+.It Fl Fl version
+Print the Nacre version and exit.
+.It Fl h , Fl Fl help
+Print command-line help and exit.
+.El
+.Pp
+When standard input is not a terminal,
+.Nm
+reads all input from stdin and executes it as a text block.
+.Sh SHELL MODEL
+Nacre chooses between command mode and Perl mode.
+.Pp
+Command mode is the default for input that looks like a normal command.
+Perl
+mode is selected for lines that clearly begin as Perl, such as variable
+assignments, loops, conditionals, package declarations, helper calls, and
+expression mode.
+.Pp
+Nacre does not implement a Perl-like language.
+Perl-mode code is real Perl,
+evaluated inside the persistent
+.Cm Nacre::User
+package.
+.Sh COMMAND MODE
+Command mode runs external commands and Nacre builtins:
+.Bd -literal -offset indent
+ls -lah
+cat README.md | grep Nacre
+echo hello > out.txt
+sleep 30 &
+jobs
+.Ed
+.Pp
+Supported command conveniences include simple pipelines, simple redirects,
+background commands, aliases, abbreviations, glob expansion, variable
+expansion, and builtins.
+.Pp
+Typing a directory by itself changes into that directory:
+.Bd -literal -offset indent
+src
+\&..
+~/Downloads
+.Ed
+.Sh PERL MODE
+Perl-looking input is evaluated as Perl:
+.Bd -literal -offset indent
+$x = 40
+say $x + 2
+for my $f (files "*.pl") { say $f }
+if (-e "Cargo.toml") { run("cargo check") }
+.Ed
+.Pp
+Expression mode starts with
+.Sq = :
+.Bd -literal -offset indent
+= 2 + 2
+= join ", ", files("*.pl")
+= perl_runtime()->{executable}
+.Ed
+.Pp
+Use
+.Ic perl-runtime
+to inspect the actual Perl executable, version, architecture, and runtime path
+being used by the shell.
+.Sh SCRIPTING
+Run one command:
+.Bd -literal -offset indent
+nacre -c 'doctor .'
+nacre -c '= 2 + 2'
+.Ed
+.Pp
+Run a script file:
+.Bd -literal -offset indent
+nacre --script file.nacre
+.Ed
+.Pp
+Run a block from stdin:
+.Bd -literal -offset indent
+printf '%s\n' 'say "hello from Perl"' | nacre --plain --no-rc
+.Ed
+.Pp
+Use
+.Fl Fl plain
+and
+.Fl Fl no-rc
+for repeatable script and test output.
+.Sh CONFIGURATION
+The canonical rc file is:
+.Bd -literal -offset indent
+~/.config/nacre/nacrerc.perl
+.Ed
+.Pp
+Nacre also creates a synced home dotfile:
+.Bd -literal -offset indent
+~/.nacrerc.perl
+.Ed
+.Pp
+On systems that support symlinks, the home dotfile may point to the canonical
+config file.
+If both files exist as regular files, Nacre synchronizes the newer
+file over the older file at startup.
+.Pp
+The rc file is Perl source evaluated in the same runtime used by interactive
+Perl mode:
+.Bd -literal -offset indent
+option transient_prompt => 1;
+option ghost_text       => 1;
+option ghost_color      => 'auto';
+option prompt_style     => 'power';
+option prompt_newline   => 1;
+option auto_title       => 1;
+
+alias ll => 'ls -lah';
+alias gs => 'git status --short --branch';
+abbr  g  => 'git';
+abbr  c  => 'cargo';
+
+env EDITOR => 'nano';
+mark src => "$ENV{HOME}/src";
+
+on preexec => sub {
+    my ($line) = @_;
+};
+
+on chpwd => sub {
+    my ($dir) = @_;
+};
+.Ed
+.Pp
+Reload configuration inside Nacre:
+.Bd -literal -offset indent
+reload
+.Ed
+.Pp
+Show configuration paths and settings:
+.Bd -literal -offset indent
+help rc
+set
+.Ed
+.Sh INTERACTIVE EDITOR
+Nacre uses a cbreak editor with history, completion, prompt redraw, and
+bracketed paste support.
+.Pp
+Common keys:
+.Bl -tag -width "Right Arrow"
+.It Ic Enter
+Run the current line or complete block.
+.It Ic Ctrl-C
+Cancel current input, or interrupt the foreground command while one runs.
+.It Ic Ctrl-D
+Exit when the input line is empty.
+.It Ic Ctrl-L
+Clear and redraw.
+.It Ic Ctrl-A , Ctrl-E
+Move to the start or end of the line.
+.It Ic Ctrl-U , Ctrl-K
+Delete before or after the cursor.
+.It Ic Ctrl-W
+Delete the previous word.
+.It Ic Tab
+Show or complete candidates.
+.It Ic Up , Down
+Move through history.
+.It Ic Left , Right
+Move the cursor.
+Right accepts ghost text when the cursor is at the end.
+.It Ic Ctrl-F
+Accept the ghost suggestion.
+.It Ic Home , End
+Move to the start or end of the line.
+.It Ic Delete
+Delete the character under the cursor.
+.El
+.Pp
+Bracketed paste inserts pasted text as one editable buffer and waits for
+.Ic Enter
+before executing it.
+.Sh GHOST SUGGESTIONS
+Ghost suggestions are generated from recent history, abbreviations, aliases,
+executable commands, and path matches.
+They are intentionally subtle and adapt
+to terminal color support.
+.Pp
+Color behavior:
+.Bl -tag -width "truecolor terminals"
+.It truecolor terminals
+Use 24-bit dim gray.
+.It 256-color terminals
+Use xterm gray 242.
+.It 16-color terminals
+Use faint bright black.
+.It Ev NO_COLOR No or plain mode
+Disable ghost text styling.
+.El
+.Sh BUILTINS
+Navigation:
+.Bd -literal -offset indent
+cd DIR
+pwd
+pushd DIR
+popd
+dirs
+up 2
+take new/project
+.Ed
+.Pp
+Marks:
+.Bd -literal -offset indent
+mark proj ~/projects/my-game
+go proj
+marks
+unmark proj
+.Ed
+.Pp
+Aliases:
+.Bd -literal -offset indent
+alias ll="ls -lah"
+alias gs="git status --short"
+aliases
+unalias ll
+.Ed
+.Pp
+Environment and path:
+.Bd -literal -offset indent
+export EDITOR=nano
+unset DEBUG
+env
+path show
+path add ~/.local/bin
+path rm /some/bad/path
+.Ed
+.Pp
+System and development helpers:
+.Bd -literal -offset indent
+sysinfo
+doctor .
+which cargo
+type cd
+history 50
+highlight script.nacre
+transcript path
+clear
+clear -x
+.Ed
+.Pp
+Job control:
+.Bd -literal -offset indent
+sleep 30 &
+jobs
+fg 1
+bg 1
+kill 1
+.Ed
+.Pp
+Timing:
+.Bd -literal -offset indent
+time -- cargo build --release
+time -p -- perl -e 'select undef,undef,undef,0.25'
+time -- ls -lah | wc -l
+.Ed
+.Sh PERL HELPERS
+These helpers are available in Perl mode and rc files:
+.Bd -literal -offset indent
+run("ls -lah")
+run("wc", "-l", "file")
+sh("echo $SHELL")
+capture("git status --short")
+cd("src")
+pwd()
+files("*.pl")
+slurp("README.md")
+spew("out.txt", "hello\n")
+append("log.txt", "entry\n")
+which("perl")
+env("EDITOR", "nano")
+edit("README.md")
+option transient_prompt => 1
+alias ll => "ls -lah"
+abbr g => "git"
+on preexec => sub { my ($line) = @_ }
+.Ed
+.Sh INSTALLATION
+Install from a release checkout:
+.Bd -literal -offset indent
+\&./install.sh
+.Ed
+.Pp
+Install to a custom prefix:
+.Bd -literal -offset indent
+PREFIX="$HOME/.local" ./install.sh
+.Ed
+.Pp
+Install using a remote script:
+.Bd -literal -offset indent
+curl -fsSL https://raw.githubusercontent.com/robert-nelson/nacre/main/install.sh | sh
+.Ed
+.Pp
+The installer copies
+.Nm ,
+.Nm nacre-update ,
+and this manual page under the selected prefix.
+.Sh UPDATING
+Update from a release checkout:
+.Bd -literal -offset indent
+\&./update.sh
+.Ed
+.Pp
+Update an installed copy:
+.Bd -literal -offset indent
+nacre-update
+.Ed
+.Sh ENVIRONMENT
+.Bl -tag -width Ds
+.It Ev NACRE_HOME
+Override the configuration directory.
+The default is
+.Pa ~/.config/nacre .
+.It Ev NACRE_RC
+Override the rc file path.
+.It Ev NO_COLOR
+Disable color output.
+.It Ev NACRE_ASCII_PROMPT
+Use an ASCII prompt.
+.It Ev NACRE_NO_GIT
+Disable Git prompt detection.
+.It Ev PREFIX
+Install or update prefix used by
+.Pa install.sh
+and
+.Pa update.sh .
+.It Ev NACRE_RAW_BASE
+Base URL used by install and update scripts for remote downloads.
+.El
+.Sh FILES
+.Bl -tag -width Ds
+.It Pa ~/.config/nacre/nacrerc.perl
+Canonical user configuration file.
+.It Pa ~/.nacrerc.perl
+Synced home dotfile for quick editing.
+.It Pa ~/.local/state/nacre/history
+Command history.
+.It Pa ~/.local/state/nacre/session.log
+Session transcript.
+.It Pa ~/.local/bin/nacre
+Default installed executable path.
+.It Pa ~/.local/bin/nacre-update
+Default installed updater path.
+.It Pa ~/.local/share/man/man1/nacre.1
+Default installed manual page path.
+.El
+.Sh EXIT STATUS
+.Ex -std
+.Pp
+When running commands with
+.Fl c ,
+.Fl Fl command ,
+.Fl Fl script ,
+or stdin, the exit status is the status returned by the executed Nacre input.
+.Sh EXAMPLES
+Start an interactive shell:
+.Bd -literal -offset indent
+nacre
+.Ed
+.Pp
+Run a project check:
+.Bd -literal -offset indent
+nacre -c 'doctor .'
+.Ed
+.Pp
+Inspect the real Perl runtime:
+.Bd -literal -offset indent
+nacre -c 'perl-runtime'
+nacre -c '= perl_runtime()->{executable}'
+.Ed
+.Pp
+Run without user configuration:
+.Bd -literal -offset indent
+nacre --plain --no-rc -c 'echo hello'
+.Ed
+.Pp
+Check Perl files in the current directory:
+.Bd -literal -offset indent
+nacre -c 'for my $f (files "*.pl") { run("perl", "-c", $f) }'
+.Ed
+.Sh COMPATIBILITY
+Nacre intentionally does not clone every Bash or POSIX shell feature.
+Use
+.Ic compat
+when exact shell syntax is required:
+.Bd -literal -offset indent
+compat 'for f in *.c; do echo "$f"; done'
+.Ed
+.Pp
+Normal Nacre command lines do not go through Bash by default.
+.Sh SEE ALSO
+.Xr perl 1
+.Pp
+Project documentation is available in
+.Pa README.md ,
+.Pa CHANGELOG.md ,
+.Pa CONTRIBUTING.md ,
+.Pa SECURITY.md ,
+and
+.Pa docs/LANGUAGE.md .
+.Sh AUTHORS
+.An Robert Nelson
+.Sh BUGS
+Report security issues according to
+.Pa SECURITY.md .
+Report other bugs through the project issue tracker.
